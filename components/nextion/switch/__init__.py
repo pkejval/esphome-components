@@ -40,7 +40,7 @@ async def to_code(config):
     switch.SwitchPublishAction,
     cv.Schema(
         {
-            cv.Required(CONF_ID): cv.use_id(switch.NextionSwitch),
+            cv.Required(CONF_ID): cv.use_id(NextionSwitch),
             cv.Required(CONF_STATE): cv.templatable(cv.boolean),
             cv.Optional(CONF_PUBLISH_STATE, default="true"): cv.templatable(cv.boolean),
             cv.Optional(CONF_SEND_TO_NEXTION, default="true"): cv.templatable(cv.boolean)

@@ -59,7 +59,7 @@ async def to_code(config):
     binary_sensor.BinarySensorPublishAction,
     cv.Schema(
         {
-            cv.Required(CONF_ID): cv.use_id(binary_sensor.NextionBinarySensor),
+            cv.Required(CONF_ID): cv.use_id(NextionBinarySensor),
             cv.Required(CONF_STATE): cv.templatable(cv.float_),
             cv.Optional(CONF_PUBLISH_STATE, default="true"): cv.templatable(cv.boolean),
             cv.Optional(CONF_SEND_TO_NEXTION, default="true"): cv.templatable(cv.boolean)
