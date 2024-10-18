@@ -49,7 +49,7 @@ template<typename... Ts> class SensorPublishAction : public Action<Ts...> {
   TEMPLATABLE_VALUE(bool, publish)
   TEMPLATABLE_VALUE(bool, send_to_nextion)
 
-  void play(Ts... x) override { this->sensor_->set_state(this->state_.value(x...), this->publish_.optional_value(x...), this->send_to_nextion_.optional_value(x...)); }
+  void set_state(Ts... x) override { this->sensor_->set_state(this->state_.value(x...), this->publish_.optional_value(x...), this->send_to_nextion_.optional_value(x...)); }
 
  protected:
   NextionSensor *sensor_;
