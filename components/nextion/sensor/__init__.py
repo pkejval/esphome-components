@@ -6,6 +6,7 @@ from esphome.components import sensor
 from esphome.const import (
     CONF_ID,
     CONF_COMPONENT_ID,
+    CONF_STATE
 )
 from .. import nextion_ns, CONF_NEXTION_ID
 
