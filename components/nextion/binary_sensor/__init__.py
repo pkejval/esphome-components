@@ -9,7 +9,12 @@ from esphome.const import (
     CONF_COMPONENT_ID, 
     CONF_PAGE_ID, 
 )
-from .. import nextion_ns, CONF_NEXTION_ID
+from .. import (
+    nextion_ns,
+    CONF_NEXTION_ID,
+    CONF_PUBLISH_STATE,
+    CONF_SEND_TO_NEXTION
+)
 
 
 from ..base_component import (

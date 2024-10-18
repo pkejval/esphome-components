@@ -28,8 +28,6 @@ CONF_FOREGROUND_PRESSED_COLOR = "foreground_pressed_color"
 CONF_FONT_ID = "font_id"
 CONF_EXIT_REPARSE_ON_START = "exit_reparse_on_start"
 CONF_SKIP_CONNECTION_HANDSHAKE = "skip_connection_handshake"
-CONF_PUBLISH_STATE = "publish_state"
-CONF_SEND_TO_NEXTION = "send_to_nextion"
 
 def NextionName(value):
     valid_chars = f"{ascii_letters + digits + '_'}."
