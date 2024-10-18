@@ -4,7 +4,7 @@ import esphome.config_validation as cv
 from esphome.components import binary_sensor
 
 from esphome.const import (
-    CONF_ID
+    CONF_ID,
     CONF_STATE,
     CONF_COMPONENT_ID, 
     CONF_PAGE_ID, 
