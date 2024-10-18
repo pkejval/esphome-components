@@ -105,7 +105,7 @@ async def to_code(config):
 
 @automation.register_action(
     "sensor.nextion.publish",
-    sensor.SensorPublishAction,
+    NextionSensorPublishAction,
     cv.Schema(
         {
             cv.Required(CONF_ID): cv.use_id(NextionSensor),
