@@ -1,6 +1,6 @@
 #pragma once
 #include "esphome/core/automation.h"
-#include "nextion.h"
+#include "nextion_sensor.h"
 
 namespace esphome {
 namespace nextion {
