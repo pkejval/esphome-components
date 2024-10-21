@@ -25,6 +25,8 @@ CODEOWNERS = ["@senexcrenshaw"]
 
 NextionSwitch = nextion_ns.class_("NextionSwitch", switch.Switch, cg.PollingComponent)
 
+NextionPublishBoolAction = nextion_ns.class_("NextionPublishBoolAction", automation.Action)
+
 CONFIG_SCHEMA = cv.All(
     switch.switch_schema(NextionSwitch)
     .extend(CONFIG_SWITCH_COMPONENT_SCHEMA)
@@ -45,7 +47,7 @@ async def to_code(config):
 
 @automation.register_action(
     "switch.nextion.publish",
-    switch.SwitchPublishAction,
+    NextionPublishBoolAction,
     cv.Schema(
         {
             cv.Required(CONF_ID): cv.use_id(NextionSwitch),
@@ -55,11 +57,17 @@ async def to_code(config):
         }
     ),
 )
-async def switch_nextion_publish_to_code(config, action_id, template_arg, args):
+async def sensor_nextion_publish_to_code(config, action_id, template_arg, args):
     paren = await cg.get_variable(config[CONF_ID])
     var = cg.new_Pvariable(action_id, template_arg, paren)
-    template_state = await cg.templatable(config[CONF_STATE], args, bool)
-    template_publish = await cg.templatable(config[CONF_PUBLISH_STATE], args, bool)
-    template_send_to_nextion = await cg.templatable(config[CONF_SEND_TO_NEXTION], args, bool)
-    cg.add(var.set_state(template_state, template_publish, template_send_to_nextion))
+
+    template_ = await cg.templatable(config[CONF_STATE], args, bool)
+    cg.add(var.set_state(template_))
+
+    template_ = await cg.templatable(config[CONF_PUBLISH_STATE], args, bool)
+    cg.add(var.set_publish_state(template_))
+
+    template_ = await cg.templatable(config[CONF_SEND_TO_NEXTION], args, bool)
+    cg.add(var.set_send_to_nextion(template_))
+
     return var
