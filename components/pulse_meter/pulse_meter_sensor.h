@@ -94,6 +94,8 @@ class PulseMeterSensor : public sensor::Sensor, public Component {
     this->coalesce_min_us_ = (this->min_low_us_ < this->min_high_us_) ? this->min_low_us_ : this->min_high_us_;
   }
 
+  inline void reset_period_estimate_() { this->period_estimate_us_ = 0.0f; }
+
   inline void update_period_estimate_(uint32_t delta_us, uint32_t count) {
     if (delta_us == 0 || count == 0)
       return;
@@ -207,6 +209,8 @@ class PulseMeterSensor : public sensor::Sensor, public Component {
   rmt_receive_config_t rmt_rx_cfg_{};
   uint32_t rmt_resolution_hz_{1000000UL};
 
+  // RMT mailbox: callback nastaví pending + (ptr,count). Loop mailbox atomicky převezme a NIKDY nenechá RMT stát.
+  volatile bool rmt_pending_{false};
   volatile const rmt_symbol_word_t *rmt_recv_symbols_{nullptr};
   volatile size_t rmt_recv_count_{0};
 #endif

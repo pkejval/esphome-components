@@ -52,7 +52,7 @@ void PulseMeterSensor::setup() {
   this->new_event_ = false;
   this->peeked_edge_ = false;
 
-  this->period_estimate_us_ = 0.0f;
+  this->reset_period_estimate_();
 
   this->last_polled_pin_val_ = this->isr_pin_.digital_read();
   this->next_poll_check_us_ = now + 2000U;
@@ -87,6 +87,10 @@ void PulseMeterSensor::setup() {
 
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
   if (this->filter_mode_ == FILTER_PULSE) {
+    this->rmt_pending_ = false;
+    this->rmt_recv_symbols_ = nullptr;
+    this->rmt_recv_count_ = 0;
+
     rmt_rx_channel_config_t ch_cfg{};
     ch_cfg.gpio_num = (gpio_num_t) this->pin_->get_pin();
     ch_cfg.clk_src = RMT_CLK_SRC_DEFAULT;
@@ -115,6 +119,7 @@ void PulseMeterSensor::setup() {
 
     if (!this->use_rmt_) {
       this->rmt_rx_channel_ = nullptr;
+      this->rmt_pending_ = false;
       this->rmt_recv_symbols_ = nullptr;
       this->rmt_recv_count_ = 0;
     }
@@ -143,10 +148,16 @@ void PulseMeterSensor::setup() {
 void PulseMeterSensor::loop() {
   const uint32_t now = micros();
 
+  // Early-return je OK jen pokud:
+  // - nemáme "new_event_" a
+  // - ještě není čas řešit timeout/check
+  // a navíc:
+  // - pro RMT: pokud není pending ani count, a nejsme u timeoutu, můžeme odejít
+  // - pro non-RMT: polling fallback podle plánu
   if (LIKELY(!this->new_event_) && LIKELY(time_before_(now, this->next_timeout_check_us_))) {
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
     if (this->use_rmt_) {
-      if (this->rmt_recv_count_ == 0) {
+      if (!this->rmt_pending_ && this->rmt_recv_count_ == 0) {
         return;
       }
     } else
@@ -165,7 +176,8 @@ void PulseMeterSensor::loop() {
 
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
   const rmt_symbol_word_t *local_syms = nullptr;
-  size_t local_count = 0;
+  size_t local_sym_count = 0;
+  bool local_rmt_consumed = false;
   bool use_rmt = this->use_rmt_;
 #endif
 
@@ -174,28 +186,37 @@ void PulseMeterSensor::loop() {
 
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
     if (use_rmt) {
-      local_syms = (const rmt_symbol_word_t *) this->rmt_recv_symbols_;
-      local_count = (size_t) this->rmt_recv_count_;
-      this->rmt_recv_symbols_ = nullptr;
-      this->rmt_recv_count_ = 0;
+      if (this->rmt_pending_ || this->rmt_recv_count_ != 0 || this->rmt_recv_symbols_ != nullptr) {
+        local_syms = (const rmt_symbol_word_t *) this->rmt_recv_symbols_;
+        local_sym_count = (size_t) this->rmt_recv_count_;
+        this->rmt_pending_ = false;
+        this->rmt_recv_symbols_ = nullptr;
+        this->rmt_recv_count_ = 0;
+        local_rmt_consumed = true;
+      }
     }
 #endif
 
-    if (!this->use_rmt_ && this->should_poll_fallback_(now)) {
-      bool current = this->isr_pin_.digital_read();
+#if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
+    if (!use_rmt)
+#endif
+    {
+      if (this->should_poll_fallback_(now)) {
+        bool current = this->isr_pin_.digital_read();
 
-      if (this->filter_mode_ == FILTER_EDGE) {
-        if (current && !this->last_polled_pin_val_) {
-          PulseMeterSensor::edge_intr(this);
+        if (this->filter_mode_ == FILTER_EDGE) {
+          if (current && !this->last_polled_pin_val_) {
+            PulseMeterSensor::edge_intr(this);
+          }
+        } else {
+          if (current != this->last_polled_pin_val_) {
+            PulseMeterSensor::pulse_intr(this);
+          }
         }
-      } else {
-        if (current != this->last_polled_pin_val_) {
-          PulseMeterSensor::pulse_intr(this);
-        }
+
+        this->last_polled_pin_val_ = current;
+        this->schedule_next_poll_(now);
       }
-
-      this->last_polled_pin_val_ = current;
-      this->schedule_next_poll_(now);
     }
 
     this->get_->count_ = 0;
@@ -210,65 +231,70 @@ void PulseMeterSensor::loop() {
   }
 
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
-  if (use_rmt && local_syms != nullptr && local_count > 0) {
-    bool latched = this->pulse_state_.latched_;
-    bool last_pin = this->pulse_state_.last_pin_val_;
-    uint32_t last_edge_us = tdet;
-    uint32_t last_rise_us = trise;
-
-    uint32_t add_cnt = 0;
-
-    for (size_t i = 0; i < local_count; ++i) {
-      const auto &w = local_syms[i];
-
-      const bool lvl0 = w.level0;
-      const uint32_t dur0_us = w.duration0;
-      if (lvl0 != last_pin) {
-        if (!last_pin) {
-          if (dur0_us >= this->min_low_us_) {
-            latched = false;
-          }
-        } else {
-          if (dur0_us >= this->min_high_us_) {
-            latched = true;
-            last_edge_us = now;
-            last_rise_us = now;
-            add_cnt++;
-          }
-        }
-        last_pin = lvl0;
-      }
-
-      const bool lvl1 = w.level1;
-      const uint32_t dur1_us = w.duration1;
-      if (lvl1 != last_pin) {
-        if (!last_pin) {
-          if (dur1_us >= this->min_low_us_) {
-            latched = false;
-          }
-        } else {
-          if (dur1_us >= this->min_high_us_) {
-            latched = true;
-            last_edge_us = now;
-            last_rise_us = now;
-            add_cnt++;
-          }
-        }
-        last_pin = lvl1;
-      }
+  if (use_rmt && local_rmt_consumed) {
+    // Vždy znovu armuj RMT i když count==0 / ptr==nullptr (řeší deadlock, který popisuješ).
+    if (this->rmt_rx_channel_ != nullptr) {
+      (void) rmt_receive(this->rmt_rx_channel_, nullptr, 0, &this->rmt_rx_cfg_);
     }
 
-    this->pulse_state_.latched_ = latched;
-    this->pulse_state_.last_pin_val_ = last_pin;
+    if (local_syms != nullptr && local_sym_count > 0) {
+      bool latched = this->pulse_state_.latched_;
+      bool last_pin = this->pulse_state_.last_pin_val_;
+      uint32_t last_edge_us = tdet;
+      uint32_t last_rise_us = trise;
 
-    if (add_cnt > 0) {
-      cnt += add_cnt;
-      tdet = last_edge_us;
-      trise = last_rise_us;
-      had_event = true;
+      uint32_t add_cnt = 0;
+
+      for (size_t i = 0; i < local_sym_count; ++i) {
+        const auto &w = local_syms[i];
+
+        const bool lvl0 = w.level0;
+        const uint32_t dur0_us = w.duration0;
+        if (lvl0 != last_pin) {
+          if (!last_pin) {
+            if (dur0_us >= this->min_low_us_) {
+              latched = false;
+            }
+          } else {
+            if (dur0_us >= this->min_high_us_) {
+              latched = true;
+              last_edge_us = now;
+              last_rise_us = now;
+              add_cnt++;
+            }
+          }
+          last_pin = lvl0;
+        }
+
+        const bool lvl1 = w.level1;
+        const uint32_t dur1_us = w.duration1;
+        if (lvl1 != last_pin) {
+          if (!last_pin) {
+            if (dur1_us >= this->min_low_us_) {
+              latched = false;
+            }
+          } else {
+            if (dur1_us >= this->min_high_us_) {
+              latched = true;
+              last_edge_us = now;
+              last_rise_us = now;
+              add_cnt++;
+            }
+          }
+          last_pin = lvl1;
+        }
+      }
+
+      this->pulse_state_.latched_ = latched;
+      this->pulse_state_.last_pin_val_ = last_pin;
+
+      if (add_cnt > 0) {
+        cnt += add_cnt;
+        tdet = last_edge_us;
+        trise = last_rise_us;
+        had_event = true;
+      }
     }
-
-    (void) rmt_receive(this->rmt_rx_channel_, nullptr, 0, &this->rmt_rx_cfg_);
   }
 #endif
 
@@ -322,6 +348,10 @@ void PulseMeterSensor::loop() {
           ESP_LOGD(TAG, "No pulse detected for %" PRIu32 "s, assuming 0 pulses/min",
                    time_since_valid_edge_us / 1000000);
           this->publish_state(0.0f);
+
+          // Důležité: reset periody, aby se polling fallback znovu aktivoval pro pomalý rozběh / edge-case.
+          this->reset_period_estimate_();
+
           this->next_timeout_check_us_ = now + this->timeout_us_;
         } else {
           this->plan_next_check_(now);
@@ -426,7 +456,12 @@ bool IRAM_ATTR PulseMeterSensor::rmt_rx_done_cb_(rmt_channel_handle_t, const rmt
                                                  void *user_ctx) {
   auto *self = static_cast<PulseMeterSensor *>(user_ctx);
 
-  if (edata == nullptr || edata->num_symbols == 0 || edata->received_symbols == nullptr) {
+  // Důležité: nastav pending vždy, aby loop věděl, že má mailbox vyzvednout a znovu armovat RMT.
+  self->rmt_pending_ = true;
+
+  if (edata == nullptr || edata->received_symbols == nullptr || edata->num_symbols == 0) {
+    self->rmt_recv_symbols_ = nullptr;
+    self->rmt_recv_count_ = 0;
     self->new_event_ = true;
     return false;
   }
