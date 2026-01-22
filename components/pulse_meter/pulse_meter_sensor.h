@@ -46,7 +46,9 @@ class PulseMeterSensor : public sensor::Sensor, public Component {
 
   void set_filter_us(uint32_t filter) {
     this->filter_us_ = filter;
-    this->update_hysteresis_defaults_();
+    if (this->min_low_us_ == 0 && this->min_high_us_ == 0) {
+      this->update_hysteresis_defaults_();
+    }
   }
 
   void set_timeout_us(uint32_t timeout) { this->timeout_us_ = timeout; }
@@ -79,18 +81,22 @@ class PulseMeterSensor : public sensor::Sensor, public Component {
   static void attach_isr_task_(void *arg);
 #endif
 
-  // wrap-safe: true, pokud now < deadline i přes wrap micros()
-  static inline bool IRAM_ATTR before_deadline_(uint32_t now, uint32_t deadline) {
+  static inline bool IRAM_ATTR time_reached_(uint32_t now, uint32_t deadline) {
+    return (int32_t) (now - deadline) >= 0;
+  }
+  static inline bool IRAM_ATTR time_before_(uint32_t now, uint32_t deadline) {
     return (int32_t) (now - deadline) < 0;
   }
 
   void update_hysteresis_defaults_() {
-    this->min_low_us_ = (this->filter_us_ * 4U) / 5U;   // 0.8x
-    this->min_high_us_ = (this->filter_us_ * 6U) / 5U;  // 1.2x
+    this->min_low_us_ = (this->filter_us_ * 4U) / 5U;
+    this->min_high_us_ = (this->filter_us_ * 6U) / 5U;
     this->coalesce_min_us_ = (this->min_low_us_ < this->min_high_us_) ? this->min_low_us_ : this->min_high_us_;
   }
 
   inline void update_period_estimate_(uint32_t delta_us, uint32_t count) {
+    if (delta_us == 0 || count == 0)
+      return;
     const float w = 0.25f;
     const float p = float(delta_us) / float(count);
     if (this->period_estimate_us_ <= 0.0f)
@@ -108,70 +114,102 @@ class PulseMeterSensor : public sensor::Sensor, public Component {
     }
     const uint32_t hard_deadline = this->last_processed_edge_us_ + this->timeout_us_;
     const uint32_t soft_deadline = now + soft_gap;
-    this->next_timeout_check_us_ = (soft_deadline < hard_deadline) ? soft_deadline : hard_deadline;
+    this->next_timeout_check_us_ = time_before_(soft_deadline, hard_deadline) ? soft_deadline : hard_deadline;
+  }
+
+  inline bool should_poll_fallback_(uint32_t now) const {
+    if (!this->poll_fallback_enabled_ || this->use_rmt_)
+      return false;
+
+    if (this->period_estimate_us_ <= 0.0f) {
+      return time_reached_(now, this->next_poll_check_us_);
+    }
+
+    const float p = this->period_estimate_us_;
+    if (p < 2000.0f) {
+      return false;
+    }
+
+    return time_reached_(now, this->next_poll_check_us_);
+  }
+
+  inline void schedule_next_poll_(uint32_t now) {
+    uint32_t interval = 2000U;
+    if (this->period_estimate_us_ > 0.0f) {
+      const uint32_t p = (uint32_t) this->period_estimate_us_;
+      interval = p > 5000U ? 5000U : (p < 2000U ? 2000U : p);
+    }
+    this->next_poll_check_us_ = now + interval;
   }
 
   InternalGPIOPin *pin_{nullptr};
-  uint32_t filter_us_ = 0;
-  uint32_t timeout_us_ = 1000000UL * 60UL * 5UL;
+  ISRInternalGPIOPin isr_pin_;
+
+  uint32_t filter_us_{0};
+  uint32_t timeout_us_{1000000UL * 60UL * 5UL};
   sensor::Sensor *total_sensor_{nullptr};
   InternalFilterMode filter_mode_{FILTER_EDGE};
 
   enum class MeterState { INITIAL, RUNNING, TIMED_OUT };
-  MeterState meter_state_ = MeterState::INITIAL;
-  bool peeked_edge_ = false;
-  uint32_t total_pulses_ = 0;
-  uint32_t last_processed_edge_us_ = 0;
+  MeterState meter_state_{MeterState::INITIAL};
+
+  uint32_t total_pulses_{0};
+  uint32_t last_processed_edge_us_{0};
+
+  bool peeked_edge_{false};
 
   struct State {
-    uint32_t last_detected_edge_us_ = 0;
-    uint32_t last_rising_edge_us_ = 0;
-    uint32_t count_ = 0;
-  } __attribute__((packed, aligned(4)));
+    uint32_t last_detected_edge_us_{0};
+    uint32_t last_rising_edge_us_{0};
+    uint32_t count_{0};
+  } __attribute__((aligned(4)));
 
   State state_[2];
-  volatile State *set_ = state_;
-  volatile State *get_ = state_ + 1;
-
-  ISRInternalGPIOPin isr_pin_;
+  volatile State *set_{state_};
+  volatile State *get_{state_ + 1};
 
   struct EdgeState {
-    uint32_t last_sent_edge_us_ = 0;
+    uint32_t last_sent_edge_us_{0};
   };
   EdgeState edge_state_{};
 
   struct PulseState {
-    uint32_t last_intr_ = 0;
-    bool latched_ = false;
-    bool last_pin_val_ = false;
+    uint32_t last_intr_{0};
+    bool latched_{false};
+    bool last_pin_val_{false};
   };
   PulseState pulse_state_{};
 
-  volatile bool new_event_ = false;
-  uint32_t next_timeout_check_us_ = 0;
+  volatile bool new_event_{false};
 
-  uint32_t min_low_us_ = 0;
-  uint32_t min_high_us_ = 0;
+  uint32_t next_timeout_check_us_{0};
 
-  float period_estimate_us_ = 0.0f;
+  uint32_t min_low_us_{0};
+  uint32_t min_high_us_{0};
+
+  float period_estimate_us_{0.0f};
+
+  bool poll_fallback_enabled_{true};
+  uint32_t next_poll_check_us_{0};
+  bool last_polled_pin_val_{false};
+
+  bool coalesce_enabled_edge_{false};
+  volatile uint32_t coalesce_until_us_{0};
+  uint32_t coalesce_min_us_{0};
 
 #if defined(ESP_IDF_VERSION) && __has_include("driver/gpio_filter.h")
   gpio_glitch_filter_handle_t glitch_filter_{nullptr};
 #endif
 
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
-  bool use_rmt_ = false;
+  bool use_rmt_{false};
   rmt_channel_handle_t rmt_rx_channel_{nullptr};
   rmt_receive_config_t rmt_rx_cfg_{};
-  volatile const rmt_symbol_word_t *rmt_recv_symbols_ = nullptr;
-  volatile size_t rmt_recv_count_ = 0;
-  uint32_t rmt_resolution_hz_ = 1000000UL;  // 1 us
-#endif
+  uint32_t rmt_resolution_hz_{1000000UL};
 
-  // Soft coalescing (pouze EDGE); wrap-safe deadline
-  bool coalesce_enabled_edge_ = true;
-  volatile uint32_t coalesce_until_us_ = 0;
-  uint32_t coalesce_min_us_ = 0;
+  volatile const rmt_symbol_word_t *rmt_recv_symbols_{nullptr};
+  volatile size_t rmt_recv_count_{0};
+#endif
 };
 
 }  // namespace pulse_meter
