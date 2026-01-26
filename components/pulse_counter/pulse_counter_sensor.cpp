@@ -67,8 +67,9 @@ bool BasicPulseCounterStorage::pulse_counter_setup(InternalGPIOPin *pin) {
   this->last_read_.store(0, std::memory_order_relaxed);
 
 #if defined(USE_ESP32)
-  const uint32_t cpu_mhz = static_cast<uint32_t>(esp_clk_cpu_freq() / 1000000UL);
-  const uint64_t ft = static_cast<uint64_t>(this->filter_us) * static_cast<uint64_t>(cpu_mhz);
+  const uint32_t cpu_hz = BasicPulseCounterStorage::cpu_freq_hz_();
+  const uint64_t cpu_mhz = static_cast<uint64_t>(cpu_hz / 1000000UL);
+  const uint64_t ft = static_cast<uint64_t>(this->filter_us) * cpu_mhz;
   this->filter_ticks_ = (ft > 0xFFFFFFFFULL) ? 0xFFFFFFFFUL : static_cast<uint32_t>(ft);
 #else
   this->filter_ticks_ = this->filter_us;

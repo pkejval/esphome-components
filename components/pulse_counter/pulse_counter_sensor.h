@@ -1,9 +1,8 @@
-// pulse_counter_sensor.h
 #pragma once
 
+#include "esphome/components/sensor/sensor.h"
 #include "esphome/core/component.h"
 #include "esphome/core/hal.h"
-#include "esphome/components/sensor/sensor.h"
 
 #include <atomic>
 #include <cinttypes>
@@ -15,12 +14,41 @@
 #include <esp_timer.h>
 #include <soc/soc_caps.h>
 #include <esp_cpu.h>
+
+#if __has_include("esp_clk_tree.h")
+#include "esp_clk_tree.h"
+#include "esp_err.h"
+#define ESPHOME_PULSE_COUNTER_HAS_CLK_TREE 1
+#else
+#define ESPHOME_PULSE_COUNTER_HAS_CLK_TREE 0
+#endif
+
+#if __has_include("soc/clk_tree_defs.h")
+#include "soc/clk_tree_defs.h"
+#define ESPHOME_PULSE_COUNTER_HAS_CLK_TREE_DEFS 1
+#else
+#define ESPHOME_PULSE_COUNTER_HAS_CLK_TREE_DEFS 0
+#endif
+
+#if __has_include(<esp_clk.h>)
 #include <esp_clk.h>
+#define ESPHOME_PULSE_COUNTER_HAS_ESP_CLK 1
+#else
+#define ESPHOME_PULSE_COUNTER_HAS_ESP_CLK 0
+#endif
+
+#if __has_include(<Arduino.h>)
+#include <Arduino.h>
+#define ESPHOME_PULSE_COUNTER_HAS_ARDUINO 1
+#else
+#define ESPHOME_PULSE_COUNTER_HAS_ARDUINO 0
+#endif
+
 #if SOC_PCNT_SUPPORTED
 #include <driver/pulse_cnt.h>
 #define HAS_PCNT
 #endif
-#endif
+#endif  // USE_ESP32
 
 namespace esphome {
 namespace pulse_counter {
@@ -57,6 +85,34 @@ struct BasicPulseCounterStorage : public PulseCounterStorageBase {
 
 #if defined(USE_ESP32)
   inline uint32_t now_ticks_() const { return esp_cpu_get_cycle_count(); }
+
+  static inline uint32_t cpu_freq_hz_() {
+#if ESPHOME_PULSE_COUNTER_HAS_CLK_TREE && ESPHOME_PULSE_COUNTER_HAS_CLK_TREE_DEFS
+    uint32_t hz = 0;
+    const esp_err_t err =
+        esp_clk_tree_src_get_freq_hz(SOC_MOD_CLK_CPU, ESP_CLK_TREE_SRC_FREQ_PRECISION_APPROX, &hz);
+    if (err == ESP_OK && hz != 0) {
+      return hz;
+    }
+#endif
+
+#if ESPHOME_PULSE_COUNTER_HAS_ESP_CLK
+    const uint32_t hz = esp_clk_cpu_freq();
+    if (hz != 0) {
+      return hz;
+    }
+#endif
+
+#if ESPHOME_PULSE_COUNTER_HAS_ARDUINO
+    const uint32_t mhz = static_cast<uint32_t>(ESP.getCpuFreqMHz());
+    if (mhz != 0) {
+      return mhz * 1000000UL;
+    }
+#endif
+
+    return 240000000UL;
+  }
+
 #else
   inline uint32_t now_ticks_() const { return micros(); }
 #endif
