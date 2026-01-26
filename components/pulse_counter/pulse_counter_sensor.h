@@ -157,7 +157,7 @@ std::unique_ptr<PulseCounterStorageBase> get_storage(bool hw_pcnt = false);
 class PulseCounterSensor : public sensor::Sensor, public PollingComponent {
  public:
   explicit PulseCounterSensor(bool hw_pcnt = false) : storage_(get_storage(hw_pcnt)) {}
-  ~PulseCounterSensor() override;
+  ~PulseCounterSensor();
 
   void set_pin(InternalGPIOPin *pin) { pin_ = pin; }
   void set_rising_edge_mode(PulseCounterCountMode mode) { storage_->rising_edge_mode = mode; }
