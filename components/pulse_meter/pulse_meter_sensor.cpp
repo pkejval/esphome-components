@@ -68,14 +68,14 @@ void PulseMeterSensor::setup() {
 #if defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32C3) || \
     defined(CONFIG_IDF_TARGET_ESP32C6)
   {
-    gpio_glitch_filter_config_t cfg{};
+    gpio_pin_glitch_filter_config_t cfg{};
     cfg.gpio_num = static_cast<gpio_num_t>(this->pin_->get_pin());
-    cfg.clk_src = GPIO_GLITCH_FILTER_CLK_SRC_DEFAULT;
+    cfg.clk_src = GLITCH_FILTER_CLK_SRC_DEFAULT;
 
     const uint32_t ns = (uint32_t) (this->filter_us_ * 1000ULL);
     cfg.window_thres_ns = ns > 0 ? ns : 0;
 
-    if (ns > 0 && gpio_new_glitch_filter(&cfg, &this->glitch_filter_) == ESP_OK && this->glitch_filter_ != nullptr) {
+    if (ns > 0 && gpio_new_pin_glitch_filter(&cfg, &this->glitch_filter_) == ESP_OK && this->glitch_filter_ != nullptr) {
       gpio_glitch_filter_enable(this->glitch_filter_);
     } else {
       this->glitch_filter_ = nullptr;
@@ -148,12 +148,6 @@ void PulseMeterSensor::setup() {
 void PulseMeterSensor::loop() {
   const uint32_t now = micros();
 
-  // Early-return je OK jen pokud:
-  // - nemáme "new_event_" a
-  // - ještě není čas řešit timeout/check
-  // a navíc:
-  // - pro RMT: pokud není pending ani count, a nejsme u timeoutu, můžeme odejít
-  // - pro non-RMT: polling fallback podle plánu
   if (LIKELY(!this->new_event_) && LIKELY(time_before_(now, this->next_timeout_check_us_))) {
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
     if (this->use_rmt_) {
@@ -232,7 +226,6 @@ void PulseMeterSensor::loop() {
 
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
   if (use_rmt && local_rmt_consumed) {
-    // Vždy znovu armuj RMT i když count==0 / ptr==nullptr (řeší deadlock, který popisuješ).
     if (this->rmt_rx_channel_ != nullptr) {
       (void) rmt_receive(this->rmt_rx_channel_, nullptr, 0, &this->rmt_rx_cfg_);
     }
@@ -349,7 +342,6 @@ void PulseMeterSensor::loop() {
                    time_since_valid_edge_us / 1000000);
           this->publish_state(0.0f);
 
-          // Důležité: reset periody, aby se polling fallback znovu aktivoval pro pomalý rozběh / edge-case.
           this->reset_period_estimate_();
 
           this->next_timeout_check_us_ = now + this->timeout_us_;
@@ -456,7 +448,6 @@ bool IRAM_ATTR PulseMeterSensor::rmt_rx_done_cb_(rmt_channel_handle_t, const rmt
                                                  void *user_ctx) {
   auto *self = static_cast<PulseMeterSensor *>(user_ctx);
 
-  // Důležité: nastav pending vždy, aby loop věděl, že má mailbox vyzvednout a znovu armovat RMT.
   self->rmt_pending_ = true;
 
   if (edata == nullptr || edata->received_symbols == nullptr || edata->num_symbols == 0) {
