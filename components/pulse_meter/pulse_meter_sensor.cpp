@@ -68,15 +68,17 @@ void PulseMeterSensor::setup() {
 #if defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32C3) || \
     defined(CONFIG_IDF_TARGET_ESP32C6)
   {
-    gpio_pin_glitch_filter_config_t cfg{};
-    cfg.gpio_num = static_cast<gpio_num_t>(this->pin_->get_pin());
-    cfg.clk_src = GLITCH_FILTER_CLK_SRC_DEFAULT;
+    // ESP32-S3: "pin glitch filter" nemá konfigurovatelný časový práh.
+    if (this->filter_us_ > 0) {
+      gpio_pin_glitch_filter_config_t cfg{};
+      cfg.gpio_num = static_cast<gpio_num_t>(this->pin_->get_pin());
+      cfg.clk_src = GLITCH_FILTER_CLK_SRC_DEFAULT;
 
-    const uint32_t ns = (uint32_t) (this->filter_us_ * 1000ULL);
-    cfg.window_thres_ns = ns > 0 ? ns : 0;
-
-    if (ns > 0 && gpio_new_pin_glitch_filter(&cfg, &this->glitch_filter_) == ESP_OK && this->glitch_filter_ != nullptr) {
-      gpio_glitch_filter_enable(this->glitch_filter_);
+      if (gpio_new_pin_glitch_filter(&cfg, &this->glitch_filter_) == ESP_OK && this->glitch_filter_ != nullptr) {
+        gpio_glitch_filter_enable(this->glitch_filter_);
+      } else {
+        this->glitch_filter_ = nullptr;
+      }
     } else {
       this->glitch_filter_ = nullptr;
     }
