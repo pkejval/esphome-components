@@ -28,8 +28,7 @@ uint32_t NextionSimple::fnv1a32_(const char *s) {
 }
 
 uint32_t NextionSimple::make_coalesce_key_(uint32_t comp_hash, TxCoalesceKind kind) {
-  // key layout: [comp_hash (upper 24-ish bits mixed)] + [kind in low 8 bits]
-  return (comp_hash ^ (comp_hash >> 16) ^ (comp_hash >> 8)) << 8 | static_cast<uint32_t>(kind);
+  return ((comp_hash ^ (comp_hash >> 16) ^ (comp_hash >> 8)) << 8) | static_cast<uint32_t>(kind);
 }
 
 void NextionSimple::dump_config() {
@@ -359,37 +358,31 @@ void NextionSimple::diagnostic_tick_() {
   }
 }
 
-// ================= TX queue (raw + coalesce) =================
+// ================= TX queue (barrier + move-to-back coalesce) =================
 
-bool NextionSimple::txq_replace_existing_(uint32_t key, const uint8_t *data, size_t len) {
-  if (key == 0 || data == nullptr || len == 0)
-    return false;
-
-  // Linear scan (TXQ_SIZE is small). Replace first match (oldest in queue).
-  size_t i = this->txq_tail_;
-  while (i != this->txq_head_) {
-    auto &slot = this->txq_[i];
-    if (slot.coalesce == 1 && slot.key == key) {
-      if (len > sizeof(slot.data))
-        len = sizeof(slot.data);
-      memcpy(slot.data, data, len);
-      slot.len = static_cast<uint16_t>(len);
-      return true;
-    }
-    i = (i + 1) & (TXQ_SIZE - 1);
+void NextionSimple::txq_prune_tombstones_() {
+  while (this->txq_tail_ != this->txq_head_ && this->txq_[this->txq_tail_].len == 0) {
+    this->txq_tail_ = (this->txq_tail_ + 1) & (TXQ_SIZE - 1);
   }
-  return false;
 }
 
-bool NextionSimple::txq_push_raw_(const uint8_t *data, size_t len) {
+bool NextionSimple::txq_push_raw_barrier_(const uint8_t *data, size_t len) {
   if (data == nullptr || len == 0)
     return false;
 
+  // Raw command acts as barrier: new epoch
+  this->tx_epoch_++;
+
+  this->txq_prune_tombstones_();
+
   size_t nh = (this->txq_head_ + 1) & (TXQ_SIZE - 1);
   if (nh == this->txq_tail_) {
+    // Drop oldest
     this->txq_tail_ = (this->txq_tail_ + 1) & (TXQ_SIZE - 1);
+    this->txq_prune_tombstones_();
     this->txq_drop_count_++;
     this->txq_overflow_ = true;
+
     nh = (this->txq_head_ + 1) & (TXQ_SIZE - 1);
     if (nh == this->txq_tail_)
       return false;
@@ -399,28 +392,79 @@ bool NextionSimple::txq_push_raw_(const uint8_t *data, size_t len) {
   if (len > sizeof(slot.data))
     len = sizeof(slot.data);
   memcpy(slot.data, data, len);
+
   slot.len = static_cast<uint16_t>(len);
   slot.key = 0;
   slot.coalesce = 0;
+  slot.epoch = this->tx_epoch_;
 
   this->txq_head_ = nh;
   return true;
 }
 
-bool NextionSimple::txq_push_coalesce_(uint32_t key, const uint8_t *data, size_t len) {
-  if (key == 0)
-    return this->txq_push_raw_(data, len);
+bool NextionSimple::txq_try_replace_same_epoch_move_to_back_(uint32_t key, const uint8_t *data, size_t len) {
+  if (key == 0 || data == nullptr || len == 0)
+    return false;
 
-  if (this->txq_replace_existing_(key, data, len)) {
+  // Replace only if same epoch (no crossing barriers), and move-to-back:
+  // we "tombstone" old entry and enqueue a fresh one at the end.
+  size_t i = this->txq_tail_;
+  while (i != this->txq_head_) {
+    auto &slot = this->txq_[i];
+    if (slot.len != 0 && slot.coalesce == 1 && slot.key == key && slot.epoch == this->tx_epoch_) {
+      slot.len = 0;  // tombstone (skip later)
+
+      this->txq_prune_tombstones_();
+
+      size_t nh = (this->txq_head_ + 1) & (TXQ_SIZE - 1);
+      if (nh == this->txq_tail_) {
+        this->txq_tail_ = (this->txq_tail_ + 1) & (TXQ_SIZE - 1);
+        this->txq_prune_tombstones_();
+        this->txq_drop_count_++;
+        this->txq_overflow_ = true;
+
+        nh = (this->txq_head_ + 1) & (TXQ_SIZE - 1);
+        if (nh == this->txq_tail_) {
+          return true;  // old entry was tombstoned; worst case we drop this update silently
+        }
+      }
+
+      auto &dst = this->txq_[this->txq_head_];
+      if (len > sizeof(dst.data))
+        len = sizeof(dst.data);
+      memcpy(dst.data, data, len);
+      dst.len = static_cast<uint16_t>(len);
+      dst.key = key;
+      dst.coalesce = 1;
+      dst.epoch = this->tx_epoch_;
+
+      this->txq_head_ = nh;
+      return true;
+    }
+
+    i = (i + 1) & (TXQ_SIZE - 1);
+  }
+
+  return false;
+}
+
+bool NextionSimple::txq_push_coalesce_(uint32_t key, const uint8_t *data, size_t len) {
+  if (data == nullptr || len == 0)
+    return false;
+
+  if (key != 0 && this->txq_try_replace_same_epoch_move_to_back_(key, data, len)) {
     return true;
   }
 
+  this->txq_prune_tombstones_();
+
   size_t nh = (this->txq_head_ + 1) & (TXQ_SIZE - 1);
   if (nh == this->txq_tail_) {
-    // Prefer dropping oldest; coalescing already keeps queue short.
     this->txq_tail_ = (this->txq_tail_ + 1) & (TXQ_SIZE - 1);
+    this->txq_prune_tombstones_();
     this->txq_drop_count_++;
     this->txq_overflow_ = true;
+
     nh = (this->txq_head_ + 1) & (TXQ_SIZE - 1);
     if (nh == this->txq_tail_)
       return false;
@@ -430,19 +474,29 @@ bool NextionSimple::txq_push_coalesce_(uint32_t key, const uint8_t *data, size_t
   if (len > sizeof(slot.data))
     len = sizeof(slot.data);
   memcpy(slot.data, data, len);
+
   slot.len = static_cast<uint16_t>(len);
   slot.key = key;
-  slot.coalesce = 1;
+  slot.coalesce = (key != 0) ? 1 : 0;
+  slot.epoch = this->tx_epoch_;
 
   this->txq_head_ = nh;
   return true;
 }
 
 bool NextionSimple::txq_pop_(TxEntry &out) {
+  this->txq_prune_tombstones_();
   if (this->txq_head_ == this->txq_tail_)
     return false;
+
   out = this->txq_[this->txq_tail_];
   this->txq_tail_ = (this->txq_tail_ + 1) & (TXQ_SIZE - 1);
+
+  // If it was a tombstone, skip it
+  if (out.len == 0) {
+    return this->txq_pop_(out);
+  }
+
   return true;
 }
 
@@ -469,7 +523,7 @@ void NextionSimple::tx_flush_() {
   TxEntry e{};
   while (sent < this->tx_max_per_loop_ && this->txq_pop_(e)) {
     if ((micros() - start_us) >= this->tx_time_budget_us_) {
-      // Budget vyčerpán – pro jednoduchost pošleme ještě tento jeden frame (už je vyndán z queue).
+      // Budget exceeded; we still send this popped entry (no requeue).
     }
     this->uart_parent_->write_array(e.data, e.len);
     sent++;
@@ -535,7 +589,7 @@ bool NextionSimple::tx_append_int_(int v) {
   return true;
 }
 
-void NextionSimple::tx_send_raw_() {
+void NextionSimple::tx_send_raw_barrier_() {
   if (this->uart_parent_ == nullptr)
     return;
 
@@ -544,7 +598,7 @@ void NextionSimple::tx_send_raw_() {
   this->tx_buf_[this->tx_len_ + 2] = 0xFF;
 
   const size_t n = this->tx_len_ + 3;
-  (void) this->txq_push_raw_(this->tx_buf_, n);
+  (void) this->txq_push_raw_barrier_(this->tx_buf_, n);
 }
 
 void NextionSimple::tx_send_coalesce_(uint32_t key) {
@@ -776,7 +830,6 @@ void NextionSimple::set_component_visibility(const std::string &component_name, 
 void NextionSimple::set_page(int page) {
   if (page < 0)
     return;
-  // Not coalesced: ordering matters
   this->send_command_printf("page %d", page);
   this->current_page_ = page;
   this->on_page_callback_.call(page);
@@ -785,13 +838,12 @@ void NextionSimple::set_page(int page) {
 void NextionSimple::set_page(const std::string &page_name) {
   if (page_name.empty())
     return;
-  // Not coalesced
   this->send_command_printf("page %s", page_name.c_str());
   this->current_page_ = -1;
   this->on_page_callback_.call(-1);
 }
 
-// ================= Low-level (enqueue raw) =================
+// ================= Low-level (raw barrier enqueue) =================
 
 void NextionSimple::send_command(const char *cmd, size_t len) {
   if (this->uart_parent_ == nullptr || cmd == nullptr)
@@ -805,7 +857,7 @@ void NextionSimple::send_command(const char *cmd, size_t len) {
   this->tx_buf_[len + 1] = 0xFF;
   this->tx_buf_[len + 2] = 0xFF;
 
-  (void) this->txq_push_raw_(this->tx_buf_, len + 3);
+  (void) this->txq_push_raw_barrier_(this->tx_buf_, len + 3);
 }
 
 void NextionSimple::send_command_printf(const char *fmt, ...) {
@@ -836,13 +888,12 @@ void NextionSimple::send_command_printf(const char *fmt, ...) {
   this->tx_buf_[len + 1] = 0xFF;
   this->tx_buf_[len + 2] = 0xFF;
 
-  (void) this->txq_push_raw_(this->tx_buf_, len + 3);
+  (void) this->txq_push_raw_barrier_(this->tx_buf_, len + 3);
 }
 
 // ================= Maintenance =================
 
 void NextionSimple::reset_nextion() {
-  // Not coalesced
   this->send_command_printf("rest");
 }
 

@@ -50,7 +50,7 @@ class NextionSimple : public Component {
   void set_page(int page);
   void set_page(const std::string &page_name);
 
-  // Low-level send (now enqueued)
+  // Low-level send (raw -> barrier)
   void send_command(const char *cmd, size_t len);
   void send_command_printf(const char *fmt, ...);
 
@@ -122,28 +122,34 @@ class NextionSimple : public Component {
   static uint32_t make_coalesce_key_(uint32_t comp_hash, TxCoalesceKind kind);
 
   struct TxEntry {
-    uint16_t len{0};
+    uint16_t len{0};              // len==0 => tombstone / skipped
     uint8_t data[256 + 3]{};
-    uint32_t key{0};       // 0 => not coalescable
-    uint8_t coalesce{0};   // 1 => coalescable
+    uint32_t key{0};              // 0 => not coalescable
+    uint32_t epoch{0};            // barrier epoch
+    uint8_t coalesce{0};          // 1 => coalescable
   };
 
   static constexpr size_t TXQ_SIZE = 32;
   static_assert((TXQ_SIZE & (TXQ_SIZE - 1)) == 0, "TXQ_SIZE must be power of two");
 
-  bool txq_push_raw_(const uint8_t *data, size_t len);
+  void txq_prune_tombstones_();
+
+  bool txq_push_raw_barrier_(const uint8_t *data, size_t len);
   bool txq_push_coalesce_(uint32_t key, const uint8_t *data, size_t len);
-  bool txq_replace_existing_(uint32_t key, const uint8_t *data, size_t len);
+  bool txq_try_replace_same_epoch_move_to_back_(uint32_t key, const uint8_t *data, size_t len);
   bool txq_pop_(TxEntry &out);
   void txq_log_overflow_if_needed_();
   void tx_flush_();
 
-  uint8_t tx_max_per_loop_{3};       // “ne realtime” default
-  uint32_t tx_time_budget_us_{1500}; // max time spent sending per loop
+  uint8_t tx_max_per_loop_{3};
+  uint32_t tx_time_budget_us_{1500};
 
   TxEntry txq_[TXQ_SIZE]{};
   size_t txq_head_{0};
   size_t txq_tail_{0};
+
+  uint32_t tx_epoch_{1};
+
   bool txq_overflow_{false};
   uint32_t txq_overflow_last_log_ms_{0};
   uint32_t txq_drop_count_{0};
@@ -155,7 +161,7 @@ class NextionSimple : public Component {
   bool tx_append_str_(const std::string &s);
   bool tx_append_int_(int v);
 
-  void tx_send_raw_();
+  void tx_send_raw_barrier_();
   void tx_send_coalesce_(uint32_t key);
 
   bool tx_append_escaped_nextion_string_(const char *s);
