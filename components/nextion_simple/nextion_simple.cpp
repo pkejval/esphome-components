@@ -16,9 +16,28 @@ const char *NextionSimple::TAG = "nextion_simple";
 
 NextionSimple::NextionSimple() = default;
 
+uint32_t NextionSimple::fnv1a32_(const char *s) {
+  if (s == nullptr)
+    return 0;
+  uint32_t h = 2166136261u;
+  for (; *s; s++) {
+    h ^= static_cast<uint8_t>(*s);
+    h *= 16777619u;
+  }
+  return h;
+}
+
+uint32_t NextionSimple::make_coalesce_key_(uint32_t comp_hash, TxCoalesceKind kind) {
+  // key layout: [comp_hash (upper 24-ish bits mixed)] + [kind in low 8 bits]
+  return (comp_hash ^ (comp_hash >> 16) ^ (comp_hash >> 8)) << 8 | static_cast<uint32_t>(kind);
+}
+
 void NextionSimple::dump_config() {
   ESP_LOGCONFIG(TAG, "Nextion Simple:");
   ESP_LOGCONFIG(TAG, "  TFT URL: %s", this->tft_url_.c_str());
+  ESP_LOGCONFIG(TAG, "  TX batching: queue=%u, max_per_loop=%u, budget=%" PRIu32 "us",
+                static_cast<unsigned>(TXQ_SIZE), static_cast<unsigned>(this->tx_max_per_loop_),
+                static_cast<uint32_t>(this->tx_time_budget_us_));
 }
 
 void NextionSimple::setup() {
@@ -34,33 +53,22 @@ void NextionSimple::setup() {
 }
 
 void NextionSimple::loop() {
-  if (this->upload_in_progress_ || this->uart_parent_ == nullptr)
+  if (this->uart_parent_ == nullptr)
+    return;
+
+  if (!this->upload_in_progress_) {
+    this->tx_flush_();
+  }
+
+  if (this->upload_in_progress_)
     return;
 
   switch (this->mode_) {
-    case NxMode::INIT: {
-      if (this->handshake_done_ || millis() >= this->init_deadline_ms_) {
-        if (!this->handshake_done_) {
-          ESP_LOGW(TAG, "Init handshake timeout, proceeding to write-only.");
-        }
-        this->enter_writeonly_mode_();
-        break;
-      }
-
-      this->drain_uart_into_ring_();
-      this->parse_from_ring_(RxFilter::INIT_ONLY);
-
-      if (this->handshake_done_ || millis() >= this->init_deadline_ms_) {
-        if (!this->handshake_done_) {
-          ESP_LOGW(TAG, "Init handshake timeout, proceeding to write-only.");
-        }
-        this->enter_writeonly_mode_();
-      }
+    case NxMode::INIT:
+      this->init_tick_();
       break;
-    }
 
     case NxMode::RUN_WRITEONLY:
-      // Write-only režim – nic nečteme
       break;
 
     case NxMode::DIAG_CHECK:
@@ -80,41 +88,87 @@ void NextionSimple::reset_rx_state_() {
   this->frame_len_ = 0;
   this->ff_term_ = 0;
   this->frame_overflow_ = false;
+  this->frame_start_ms_ = 0;
+  this->frame_bytes_seen_ = 0;
+}
+
+static inline bool is_init_start(uint8_t b) { return b == 0x66 || b == 0x88 || b == 0x00; }
+static inline bool is_diag_start(uint8_t b) { return b == 0x70 || b == 0x71; }
+
+void NextionSimple::log_rx_drops_if_needed_() {
+  const uint32_t now = millis();
+
+  if (this->rx_rb_drop_count_ != 0 && (now - this->rx_rb_drop_last_log_ms_ >= 1000)) {
+    ESP_LOGW(TAG, "RX ring dropped %" PRIu32 " byte(s) in last ~1s", this->rx_rb_drop_count_);
+    this->rx_rb_drop_count_ = 0;
+    this->rx_rb_drop_last_log_ms_ = now;
+  }
+
+  if (this->rx_frame_drop_count_ != 0 && (now - this->rx_frame_drop_last_log_ms_ >= 1000)) {
+    ESP_LOGW(TAG, "Dropped %" PRIu32 " RX frame(s) due to overflow in last ~1s", this->rx_frame_drop_count_);
+    this->rx_frame_drop_count_ = 0;
+    this->rx_frame_drop_last_log_ms_ = now;
+  }
 }
 
 void NextionSimple::drain_uart_into_ring_() {
   if (!this->rx_enabled_ || this->uart_parent_ == nullptr)
     return;
 
+  const uint32_t start_us = micros();
   uint32_t drained = 0;
+
   while (this->uart_parent_->available() && drained < this->rx_drain_max_per_loop_) {
-    uint8_t b;
-    if (!this->uart_parent_->read_byte(&b))
+    if ((micros() - start_us) >= this->rx_time_budget_us_)
       break;
-    this->rb_push_(b);
-    drained++;
-  }
 
-  if (this->rb_overflow_) {
-    this->rb_overflow_ = false;
-    this->rx_rb_overflow_count_++;
+    size_t avail = static_cast<size_t>(this->uart_parent_->available());
+    if (avail == 0)
+      break;
 
-    const uint32_t now = millis();
-    if (now - this->rx_rb_overflow_last_log_ms_ >= 1000) {
-      ESP_LOGW(TAG, "RX ring overflow (%" PRIu32 "x in last ~1s)", this->rx_rb_overflow_count_);
-      this->rx_rb_overflow_count_ = 0;
-      this->rx_rb_overflow_last_log_ms_ = now;
+    const size_t remaining = static_cast<size_t>(this->rx_drain_max_per_loop_ - drained);
+    size_t to_read = avail;
+    if (to_read > remaining)
+      to_read = remaining;
+    if (to_read > sizeof(this->rx_read_buf_))
+      to_read = sizeof(this->rx_read_buf_);
+
+    if (to_read <= 1) {
+      uint8_t b;
+      if (!this->uart_parent_->read_byte(&b))
+        break;
+      (void) this->rb_push_(b);
+      drained++;
+      continue;
     }
+
+    if (!this->uart_parent_->read_array(this->rx_read_buf_, to_read)) {
+      uint8_t b;
+      if (!this->uart_parent_->read_byte(&b))
+        break;
+      (void) this->rb_push_(b);
+      drained++;
+      continue;
+    }
+
+    for (size_t i = 0; i < to_read; i++) {
+      (void) this->rb_push_(this->rx_read_buf_[i]);
+    }
+    drained += static_cast<uint32_t>(to_read);
   }
+
+  this->log_rx_drops_if_needed_();
 }
 
-static inline bool is_init_start(uint8_t b) { return b == 0x66 || b == 0x88 || b == 0x00; }
-static inline bool is_diag_start(uint8_t b) { return b == 0x70 || b == 0x71; }
-
-void NextionSimple::parse_from_ring_(RxFilter filter) {
+bool NextionSimple::parse_from_ring_(RxFilter filter) {
+  const uint32_t start_us = micros();
   uint8_t b;
 
   while (this->rb_pop_(b)) {
+    if ((micros() - start_us) >= this->rx_time_budget_us_) {
+      return false;
+    }
+
     if (!this->in_frame_) {
       const bool start = (filter == RxFilter::INIT_ONLY) ? is_init_start(b) : is_diag_start(b);
       if (!start)
@@ -125,6 +179,21 @@ void NextionSimple::parse_from_ring_(RxFilter filter) {
       this->frame_len_ = 1;
       this->ff_term_ = 0;
       this->frame_overflow_ = false;
+      this->frame_start_ms_ = millis();
+      this->frame_bytes_seen_ = 1;
+      continue;
+    }
+
+    this->frame_bytes_seen_++;
+    const uint32_t now_ms = millis();
+    if ((now_ms - this->frame_start_ms_) > this->frame_timeout_ms_ ||
+        this->frame_bytes_seen_ > this->frame_max_bytes_seen_) {
+      this->in_frame_ = false;
+      this->frame_len_ = 0;
+      this->ff_term_ = 0;
+      this->frame_overflow_ = false;
+      this->frame_start_ms_ = 0;
+      this->frame_bytes_seen_ = 0;
       continue;
     }
 
@@ -132,7 +201,6 @@ void NextionSimple::parse_from_ring_(RxFilter filter) {
       if (this->frame_len_ < FRAME_BUF_SIZE) {
         this->frame_buf_[this->frame_len_++] = b;
       } else {
-        // Frame je delší než náš buffer: zahodíme payload a budeme jen čekat na terminátor
         this->frame_overflow_ = true;
         this->rx_frame_drop_count_++;
       }
@@ -143,28 +211,26 @@ void NextionSimple::parse_from_ring_(RxFilter filter) {
         if (!this->frame_overflow_) {
           const size_t len_no_term = (this->frame_len_ >= 3) ? (this->frame_len_ - 3) : 0;
           this->handle_frame_(filter, this->frame_buf_, len_no_term);
-        } else {
-          const uint32_t now = millis();
-          if (now - this->rx_frame_drop_last_log_ms_ >= 1000 && this->rx_frame_drop_count_ > 0) {
-            ESP_LOGW(TAG, "Dropped RX frame(s) due to overflow (%" PRIu32 "x in last ~1s)", this->rx_frame_drop_count_);
-            this->rx_frame_drop_count_ = 0;
-            this->rx_frame_drop_last_log_ms_ = now;
-          }
         }
 
         this->in_frame_ = false;
         this->frame_len_ = 0;
         this->ff_term_ = 0;
         this->frame_overflow_ = false;
+        this->frame_start_ms_ = 0;
+        this->frame_bytes_seen_ = 0;
 
         if ((filter == RxFilter::INIT_ONLY && this->handshake_done_) ||
-            (filter == RxFilter::DIAG_ONLY && this->saw_expected_reply_))
-          return;
+            (filter == RxFilter::DIAG_ONLY && this->saw_expected_reply_)) {
+          return true;
+        }
       }
     } else {
       this->ff_term_ = 0;
     }
   }
+
+  return false;
 }
 
 void NextionSimple::handle_frame_(RxFilter filter, const uint8_t *frame, size_t len_no_term) {
@@ -180,7 +246,7 @@ void NextionSimple::handle_frame_(RxFilter filter, const uint8_t *frame, size_t 
   }
 
   switch (code) {
-    case 0x66: {  // sendme response: 0x66, page_id
+    case 0x66: {
       if (len_no_term >= 2) {
         this->current_page_ = static_cast<int>(frame[1]);
         this->on_page_callback_.call(this->current_page_);
@@ -188,7 +254,7 @@ void NextionSimple::handle_frame_(RxFilter filter, const uint8_t *frame, size_t 
       this->handshake_done_ = true;
       break;
     }
-    case 0x88:  // OK
+    case 0x88:
       break;
     case 0x00:
       ESP_LOGW(TAG, "Nextion returned invalid instruction during INIT");
@@ -199,6 +265,27 @@ void NextionSimple::handle_frame_(RxFilter filter, const uint8_t *frame, size_t 
 }
 
 // ================= Modes =================
+
+void NextionSimple::init_tick_() {
+  const uint32_t now = millis();
+  if (this->handshake_done_ || now >= this->init_deadline_ms_) {
+    if (!this->handshake_done_) {
+      ESP_LOGW(TAG, "Init handshake timeout, proceeding to write-only.");
+    }
+    this->enter_writeonly_mode_();
+    return;
+  }
+
+  this->drain_uart_into_ring_();
+  (void) this->parse_from_ring_(RxFilter::INIT_ONLY);
+
+  if (this->handshake_done_ || millis() >= this->init_deadline_ms_) {
+    if (!this->handshake_done_) {
+      ESP_LOGW(TAG, "Init handshake timeout, proceeding to write-only.");
+    }
+    this->enter_writeonly_mode_();
+  }
+}
 
 void NextionSimple::start_init_handshake_() {
   this->mode_ = NxMode::INIT;
@@ -246,7 +333,7 @@ void NextionSimple::request_health_check_() {
   this->rx_enabled_ = true;
   this->saw_expected_reply_ = false;
   this->reset_rx_state_();
-  this->diag_deadline_ms_ = millis() + 100;
+  this->diag_deadline_ms_ = millis() + this->diag_timeout_ms_;
   this->mode_ = NxMode::DIAG_CHECK;
 
   this->send_command_printf("get dim");
@@ -259,7 +346,7 @@ void NextionSimple::diagnostic_tick_() {
   }
 
   this->drain_uart_into_ring_();
-  this->parse_from_ring_(RxFilter::DIAG_ONLY);
+  (void) this->parse_from_ring_(RxFilter::DIAG_ONLY);
 
   if (this->saw_expected_reply_ || millis() >= this->diag_deadline_ms_) {
     if (this->bkcmd_ != 0) {
@@ -272,9 +359,205 @@ void NextionSimple::diagnostic_tick_() {
   }
 }
 
-// ================= TX helpers =================
+// ================= TX queue (raw + coalesce) =================
 
-bool NextionSimple::can_tx_() const { return !this->upload_in_progress_ && this->uart_parent_ != nullptr; }
+bool NextionSimple::txq_replace_existing_(uint32_t key, const uint8_t *data, size_t len) {
+  if (key == 0 || data == nullptr || len == 0)
+    return false;
+
+  // Linear scan (TXQ_SIZE is small). Replace first match (oldest in queue).
+  size_t i = this->txq_tail_;
+  while (i != this->txq_head_) {
+    auto &slot = this->txq_[i];
+    if (slot.coalesce == 1 && slot.key == key) {
+      if (len > sizeof(slot.data))
+        len = sizeof(slot.data);
+      memcpy(slot.data, data, len);
+      slot.len = static_cast<uint16_t>(len);
+      return true;
+    }
+    i = (i + 1) & (TXQ_SIZE - 1);
+  }
+  return false;
+}
+
+bool NextionSimple::txq_push_raw_(const uint8_t *data, size_t len) {
+  if (data == nullptr || len == 0)
+    return false;
+
+  size_t nh = (this->txq_head_ + 1) & (TXQ_SIZE - 1);
+  if (nh == this->txq_tail_) {
+    this->txq_tail_ = (this->txq_tail_ + 1) & (TXQ_SIZE - 1);
+    this->txq_drop_count_++;
+    this->txq_overflow_ = true;
+    nh = (this->txq_head_ + 1) & (TXQ_SIZE - 1);
+    if (nh == this->txq_tail_)
+      return false;
+  }
+
+  auto &slot = this->txq_[this->txq_head_];
+  if (len > sizeof(slot.data))
+    len = sizeof(slot.data);
+  memcpy(slot.data, data, len);
+  slot.len = static_cast<uint16_t>(len);
+  slot.key = 0;
+  slot.coalesce = 0;
+
+  this->txq_head_ = nh;
+  return true;
+}
+
+bool NextionSimple::txq_push_coalesce_(uint32_t key, const uint8_t *data, size_t len) {
+  if (key == 0)
+    return this->txq_push_raw_(data, len);
+
+  if (this->txq_replace_existing_(key, data, len)) {
+    return true;
+  }
+
+  size_t nh = (this->txq_head_ + 1) & (TXQ_SIZE - 1);
+  if (nh == this->txq_tail_) {
+    // Prefer dropping oldest; coalescing already keeps queue short.
+    this->txq_tail_ = (this->txq_tail_ + 1) & (TXQ_SIZE - 1);
+    this->txq_drop_count_++;
+    this->txq_overflow_ = true;
+    nh = (this->txq_head_ + 1) & (TXQ_SIZE - 1);
+    if (nh == this->txq_tail_)
+      return false;
+  }
+
+  auto &slot = this->txq_[this->txq_head_];
+  if (len > sizeof(slot.data))
+    len = sizeof(slot.data);
+  memcpy(slot.data, data, len);
+  slot.len = static_cast<uint16_t>(len);
+  slot.key = key;
+  slot.coalesce = 1;
+
+  this->txq_head_ = nh;
+  return true;
+}
+
+bool NextionSimple::txq_pop_(TxEntry &out) {
+  if (this->txq_head_ == this->txq_tail_)
+    return false;
+  out = this->txq_[this->txq_tail_];
+  this->txq_tail_ = (this->txq_tail_ + 1) & (TXQ_SIZE - 1);
+  return true;
+}
+
+void NextionSimple::txq_log_overflow_if_needed_() {
+  if (!this->txq_overflow_)
+    return;
+
+  const uint32_t now = millis();
+  if (now - this->txq_overflow_last_log_ms_ >= 1000) {
+    ESP_LOGW(TAG, "TX queue overflow: dropped %" PRIu32 " cmd(s) in last ~1s", this->txq_drop_count_);
+    this->txq_drop_count_ = 0;
+    this->txq_overflow_last_log_ms_ = now;
+  }
+  this->txq_overflow_ = false;
+}
+
+void NextionSimple::tx_flush_() {
+  if (this->uart_parent_ == nullptr)
+    return;
+
+  const uint32_t start_us = micros();
+  uint8_t sent = 0;
+
+  TxEntry e{};
+  while (sent < this->tx_max_per_loop_ && this->txq_pop_(e)) {
+    if ((micros() - start_us) >= this->tx_time_budget_us_) {
+      // Budget vyčerpán – pro jednoduchost pošleme ještě tento jeden frame (už je vyndán z queue).
+    }
+    this->uart_parent_->write_array(e.data, e.len);
+    sent++;
+  }
+
+  this->txq_log_overflow_if_needed_();
+}
+
+// ================= TX builders =================
+
+void NextionSimple::tx_begin_() { this->tx_len_ = 0; }
+
+bool NextionSimple::tx_append_char_(char c) {
+  if (this->tx_len_ >= kMaxCmd)
+    return false;
+  this->tx_buf_[this->tx_len_++] = static_cast<uint8_t>(c);
+  return true;
+}
+
+bool NextionSimple::tx_append_cstr_(const char *s) {
+  if (s == nullptr)
+    return false;
+  while (*s) {
+    if (!tx_append_char_(*s++))
+      return false;
+  }
+  return true;
+}
+
+bool NextionSimple::tx_append_str_(const std::string &s) {
+  const size_t n = s.size();
+  if (this->tx_len_ + n > kMaxCmd)
+    return false;
+  memcpy(this->tx_buf_ + this->tx_len_, s.data(), n);
+  this->tx_len_ += n;
+  return true;
+}
+
+bool NextionSimple::tx_append_int_(int v) {
+  if (this->tx_len_ >= kMaxCmd)
+    return false;
+
+  uint32_t x;
+  if (v < 0) {
+    if (!tx_append_char_('-'))
+      return false;
+    x = static_cast<uint32_t>(-(int64_t) v);
+  } else {
+    x = static_cast<uint32_t>(v);
+  }
+
+  char tmp[12];
+  int i = 0;
+  do {
+    tmp[i++] = static_cast<char>('0' + (x % 10));
+    x /= 10;
+  } while (x != 0 && i < static_cast<int>(sizeof(tmp)));
+
+  while (i--) {
+    if (!tx_append_char_(tmp[i]))
+      return false;
+  }
+  return true;
+}
+
+void NextionSimple::tx_send_raw_() {
+  if (this->uart_parent_ == nullptr)
+    return;
+
+  this->tx_buf_[this->tx_len_] = 0xFF;
+  this->tx_buf_[this->tx_len_ + 1] = 0xFF;
+  this->tx_buf_[this->tx_len_ + 2] = 0xFF;
+
+  const size_t n = this->tx_len_ + 3;
+  (void) this->txq_push_raw_(this->tx_buf_, n);
+}
+
+void NextionSimple::tx_send_coalesce_(uint32_t key) {
+  if (this->uart_parent_ == nullptr)
+    return;
+
+  this->tx_buf_[this->tx_len_] = 0xFF;
+  this->tx_buf_[this->tx_len_ + 1] = 0xFF;
+  this->tx_buf_[this->tx_len_ + 2] = 0xFF;
+
+  const size_t n = this->tx_len_ + 3;
+  (void) this->txq_push_coalesce_(key, this->tx_buf_, n);
+}
 
 bool NextionSimple::tx_append_escaped_nextion_string_(const char *s) {
   if (s == nullptr)
@@ -294,7 +577,6 @@ bool NextionSimple::tx_append_escaped_nextion_string_(const char *s) {
       case '\r':
       case '\n':
       case '\t':
-        // Nextion stringy jsou citlivé; raději nahradit mezerou
         if (!this->tx_append_char_(' '))
           return false;
         break;
@@ -311,8 +593,8 @@ bool NextionSimple::tx_append_escaped_nextion_string_(const std::string &s) {
   return this->tx_append_escaped_nextion_string_(s.c_str());
 }
 
-void NextionSimple::send_prop_int_(const std::string &component_name, const char *prop, int value) {
-  if (!this->can_tx_())
+void NextionSimple::send_prop_int_(const std::string &component_name, const char *prop, TxCoalesceKind kind, int value) {
+  if (this->uart_parent_ == nullptr)
     return;
 
   this->tx_begin_();
@@ -324,12 +606,15 @@ void NextionSimple::send_prop_int_(const std::string &component_name, const char
   ok &= this->tx_append_char_('=');
   ok &= this->tx_append_int_(value);
 
-  if (ok)
-    this->tx_send_();
+  if (!ok)
+    return;
+
+  const uint32_t key = make_coalesce_key_(fnv1a32_(component_name.c_str()), kind);
+  this->tx_send_coalesce_(key);
 }
 
 void NextionSimple::send_vis_(const std::string &component_name, int state) {
-  if (!this->can_tx_())
+  if (this->uart_parent_ == nullptr)
     return;
 
   this->tx_begin_();
@@ -340,12 +625,15 @@ void NextionSimple::send_vis_(const std::string &component_name, int state) {
   ok &= this->tx_append_char_(',');
   ok &= this->tx_append_int_(state);
 
-  if (ok)
-    this->tx_send_();
+  if (!ok)
+    return;
+
+  const uint32_t key = make_coalesce_key_(fnv1a32_(component_name.c_str()), TxCoalesceKind::VIS);
+  this->tx_send_coalesce_(key);
 }
 
 void NextionSimple::send_set_text_(const std::string &component_name, const char *text) {
-  if (!this->can_tx_())
+  if (this->uart_parent_ == nullptr)
     return;
 
   this->tx_begin_();
@@ -356,13 +644,16 @@ void NextionSimple::send_set_text_(const std::string &component_name, const char
   ok &= this->tx_append_escaped_nextion_string_(text);
   ok &= this->tx_append_char_('"');
 
-  if (ok)
-    this->tx_send_();
+  if (!ok)
+    return;
+
+  const uint32_t key = make_coalesce_key_(fnv1a32_(component_name.c_str()), TxCoalesceKind::TXT);
+  this->tx_send_coalesce_(key);
 }
 
 void NextionSimple::send_set_text_formatted_(const std::string &component_name, const std::string &fmt,
                                             const std::vector<std::string> &args) {
-  if (!this->can_tx_())
+  if (this->uart_parent_ == nullptr)
     return;
 
   this->tx_begin_();
@@ -379,9 +670,10 @@ void NextionSimple::send_set_text_formatted_(const std::string &component_name, 
       if (arg_i < args.size()) {
         ok &= this->tx_append_escaped_nextion_string_(args[arg_i++]);
         p += 2;
+        if (!ok)
+          break;
         continue;
       }
-      // Došly args – zbytek necháme jako literal (vč. "%s")
     }
 
     const char c = *p++;
@@ -410,31 +702,30 @@ void NextionSimple::send_set_text_formatted_(const std::string &component_name, 
 
   ok &= this->tx_append_char_('"');
 
-  if (ok)
-    this->tx_send_();
+  if (!ok)
+    return;
+
+  const uint32_t key = make_coalesce_key_(fnv1a32_(component_name.c_str()), TxCoalesceKind::TXT);
+  this->tx_send_coalesce_(key);
 }
 
 // ================= High-level API =================
 
 void NextionSimple::set_component_value(const std::string &component_name, float value) {
-  this->send_prop_int_(component_name, "val", static_cast<int>(value));
+  this->send_prop_int_(component_name, "val", TxCoalesceKind::VAL, static_cast<int>(value));
 }
 
 void NextionSimple::set_component_text(const std::string &component_name, const std::string &text,
                                        const std::vector<std::string> &args) {
-  if (!this->can_tx_())
-    return;
-
   if (args.empty()) {
     this->send_set_text_(component_name, text.c_str());
     return;
   }
-
   this->send_set_text_formatted_(component_name, text, args);
 }
 
 void NextionSimple::set_component_text_printf(const std::string &component_name, const char *format, ...) {
-  if (!this->can_tx_() || format == nullptr)
+  if (format == nullptr)
     return;
 
   char text[160];
@@ -451,15 +742,15 @@ void NextionSimple::set_component_text_printf(const std::string &component_name,
 }
 
 void NextionSimple::set_component_picc(const std::string &component_name, int value) {
-  this->send_prop_int_(component_name, "picc", value);
+  this->send_prop_int_(component_name, "picc", TxCoalesceKind::PICC, value);
 }
 
 void NextionSimple::set_component_picc1(const std::string &component_name, int value) {
-  this->send_prop_int_(component_name, "picc1", value);
+  this->send_prop_int_(component_name, "picc1", TxCoalesceKind::PICC1, value);
 }
 
 void NextionSimple::set_component_background_color(const std::string &component_name, int color) {
-  this->send_prop_int_(component_name, "bco", color);
+  this->send_prop_int_(component_name, "bco", TxCoalesceKind::BCO, color);
 }
 
 void NextionSimple::set_component_background_color(const std::string &component_name, Color color) {
@@ -467,7 +758,7 @@ void NextionSimple::set_component_background_color(const std::string &component_
 }
 
 void NextionSimple::set_component_font_color(const std::string &component_name, int color) {
-  this->send_prop_int_(component_name, "pco", color);
+  this->send_prop_int_(component_name, "pco", TxCoalesceKind::PCO, color);
 }
 
 void NextionSimple::set_component_font_color(const std::string &component_name, Color color) {
@@ -485,6 +776,7 @@ void NextionSimple::set_component_visibility(const std::string &component_name, 
 void NextionSimple::set_page(int page) {
   if (page < 0)
     return;
+  // Not coalesced: ordering matters
   this->send_command_printf("page %d", page);
   this->current_page_ = page;
   this->on_page_callback_.call(page);
@@ -493,15 +785,16 @@ void NextionSimple::set_page(int page) {
 void NextionSimple::set_page(const std::string &page_name) {
   if (page_name.empty())
     return;
+  // Not coalesced
   this->send_command_printf("page %s", page_name.c_str());
   this->current_page_ = -1;
   this->on_page_callback_.call(-1);
 }
 
-// ================= Low-level =================
+// ================= Low-level (enqueue raw) =================
 
 void NextionSimple::send_command(const char *cmd, size_t len) {
-  if (!this->can_tx_() || cmd == nullptr)
+  if (this->uart_parent_ == nullptr || cmd == nullptr)
     return;
 
   if (len > kMaxCmd)
@@ -512,11 +805,11 @@ void NextionSimple::send_command(const char *cmd, size_t len) {
   this->tx_buf_[len + 1] = 0xFF;
   this->tx_buf_[len + 2] = 0xFF;
 
-  this->uart_parent_->write_array(this->tx_buf_, len + 3);
+  (void) this->txq_push_raw_(this->tx_buf_, len + 3);
 }
 
 void NextionSimple::send_command_printf(const char *fmt, ...) {
-  if (!this->can_tx_() || fmt == nullptr)
+  if (this->uart_parent_ == nullptr || fmt == nullptr)
     return;
 
   va_list ap;
@@ -543,12 +836,13 @@ void NextionSimple::send_command_printf(const char *fmt, ...) {
   this->tx_buf_[len + 1] = 0xFF;
   this->tx_buf_[len + 2] = 0xFF;
 
-  this->uart_parent_->write_array(this->tx_buf_, len + 3);
+  (void) this->txq_push_raw_(this->tx_buf_, len + 3);
 }
 
 // ================= Maintenance =================
 
 void NextionSimple::reset_nextion() {
+  // Not coalesced
   this->send_command_printf("rest");
 }
 
@@ -559,6 +853,9 @@ void NextionSimple::upload_tft() {
   }
   if (this->upload_in_progress_)
     return;
+
+  // Flush queue before upload
+  this->tx_flush_();
 
   this->upload_in_progress_ = true;
 #if defined(USE_ESP_IDF)

@@ -1,3 +1,5 @@
+// nextion_simple.h
+
 #pragma once
 
 #include "esphome/core/component.h"
@@ -28,6 +30,10 @@ class NextionSimple : public Component {
   void set_tft_url(const std::string &tft_url) { this->tft_url_ = tft_url; }
   void set_nextion_ready_cooldown(uint32_t cooldown) { nextion_ready_cooldown_ = cooldown; }
 
+  // TX batching tunables (optional)
+  void set_tx_max_per_loop(uint8_t v) { this->tx_max_per_loop_ = v; }
+  void set_tx_time_budget_us(uint32_t v) { this->tx_time_budget_us_ = v; }
+
   // High-level API
   void set_component_value(const std::string &component_name, float value);
   void set_component_text(const std::string &component_name, const std::string &text,
@@ -44,7 +50,7 @@ class NextionSimple : public Component {
   void set_page(int page);
   void set_page(const std::string &page_name);
 
-  // Low-level send
+  // Low-level send (now enqueued)
   void send_command(const char *cmd, size_t len);
   void send_command_printf(const char *fmt, ...);
 
@@ -77,6 +83,7 @@ class NextionSimple : public Component {
   void start_init_handshake_();
   void enter_writeonly_mode_();
   void request_health_check_();
+  void init_tick_();
   void diagnostic_tick_();
 
   // ===== RX =====
@@ -84,8 +91,10 @@ class NextionSimple : public Component {
   void reset_rx_state_();
 
   enum class RxFilter : uint8_t { INIT_ONLY, DIAG_ONLY };
-  void parse_from_ring_(RxFilter filter);
+  bool parse_from_ring_(RxFilter filter);
   void handle_frame_(RxFilter filter, const uint8_t *frame, size_t len_no_term);
+
+  void log_rx_drops_if_needed_();
 
   // ===== Utils =====
   inline int color_to_integer_(Color color) {
@@ -97,77 +106,62 @@ class NextionSimple : public Component {
 
   uint32_t get_free_heap_();
 
-  // ===== TX =====
-  bool can_tx_() const;
+  // ===== TX batching + coalescing =====
+  enum class TxCoalesceKind : uint8_t {
+    NONE = 0,
+    VAL = 1,
+    TXT = 2,
+    PCO = 3,
+    BCO = 4,
+    PICC = 5,
+    PICC1 = 6,
+    VIS = 7,
+  };
 
-  inline void tx_begin_() { this->tx_len_ = 0; }
+  static uint32_t fnv1a32_(const char *s);
+  static uint32_t make_coalesce_key_(uint32_t comp_hash, TxCoalesceKind kind);
 
-  inline bool tx_append_char_(char c) {
-    if (this->tx_len_ >= kMaxCmd)
-      return false;
-    this->tx_buf_[this->tx_len_++] = static_cast<uint8_t>(c);
-    return true;
-  }
+  struct TxEntry {
+    uint16_t len{0};
+    uint8_t data[256 + 3]{};
+    uint32_t key{0};       // 0 => not coalescable
+    uint8_t coalesce{0};   // 1 => coalescable
+  };
 
-  inline bool tx_append_cstr_(const char *s) {
-    if (s == nullptr)
-      return false;
-    while (*s) {
-      if (!tx_append_char_(*s++))
-        return false;
-    }
-    return true;
-  }
+  static constexpr size_t TXQ_SIZE = 32;
+  static_assert((TXQ_SIZE & (TXQ_SIZE - 1)) == 0, "TXQ_SIZE must be power of two");
 
-  inline bool tx_append_str_(const std::string &s) {
-    const size_t n = s.size();
-    if (this->tx_len_ + n > kMaxCmd)
-      return false;
-    memcpy(this->tx_buf_ + this->tx_len_, s.data(), n);
-    this->tx_len_ += n;
-    return true;
-  }
+  bool txq_push_raw_(const uint8_t *data, size_t len);
+  bool txq_push_coalesce_(uint32_t key, const uint8_t *data, size_t len);
+  bool txq_replace_existing_(uint32_t key, const uint8_t *data, size_t len);
+  bool txq_pop_(TxEntry &out);
+  void txq_log_overflow_if_needed_();
+  void tx_flush_();
 
-  inline bool tx_append_int_(int v) {
-    if (this->tx_len_ >= kMaxCmd)
-      return false;
+  uint8_t tx_max_per_loop_{3};       // “ne realtime” default
+  uint32_t tx_time_budget_us_{1500}; // max time spent sending per loop
 
-    uint32_t x;
-    if (v < 0) {
-      if (!tx_append_char_('-'))
-        return false;
-      x = static_cast<uint32_t>(-(int64_t) v);
-    } else {
-      x = static_cast<uint32_t>(v);
-    }
+  TxEntry txq_[TXQ_SIZE]{};
+  size_t txq_head_{0};
+  size_t txq_tail_{0};
+  bool txq_overflow_{false};
+  uint32_t txq_overflow_last_log_ms_{0};
+  uint32_t txq_drop_count_{0};
 
-    char tmp[12];
-    int i = 0;
-    do {
-      tmp[i++] = static_cast<char>('0' + (x % 10));
-      x /= 10;
-    } while (x != 0 && i < static_cast<int>(sizeof(tmp)));
+  // ===== TX (builders) =====
+  void tx_begin_();
+  bool tx_append_char_(char c);
+  bool tx_append_cstr_(const char *s);
+  bool tx_append_str_(const std::string &s);
+  bool tx_append_int_(int v);
 
-    while (i--) {
-      if (!tx_append_char_(tmp[i]))
-        return false;
-    }
-    return true;
-  }
-
-  inline void tx_send_() {
-    if (!this->can_tx_())
-      return;
-    this->tx_buf_[this->tx_len_] = 0xFF;
-    this->tx_buf_[this->tx_len_ + 1] = 0xFF;
-    this->tx_buf_[this->tx_len_ + 2] = 0xFF;
-    this->uart_parent_->write_array(this->tx_buf_, this->tx_len_ + 3);
-  }
+  void tx_send_raw_();
+  void tx_send_coalesce_(uint32_t key);
 
   bool tx_append_escaped_nextion_string_(const char *s);
   bool tx_append_escaped_nextion_string_(const std::string &s);
 
-  void send_prop_int_(const std::string &component_name, const char *prop, int value);
+  void send_prop_int_(const std::string &component_name, const char *prop, TxCoalesceKind kind, int value);
   void send_vis_(const std::string &component_name, int state);
   void send_set_text_(const std::string &component_name, const char *text);
   void send_set_text_formatted_(const std::string &component_name, const std::string &fmt,
@@ -191,10 +185,20 @@ class NextionSimple : public Component {
   size_t rb_tail_{0};
   bool rb_overflow_{false};
 
-  uint32_t rx_rb_overflow_last_log_ms_{0};
-  uint32_t rx_rb_overflow_count_{0};
+  uint32_t rx_rb_drop_last_log_ms_{0};
+  uint32_t rx_rb_drop_count_{0};
 
   uint32_t rx_drain_max_per_loop_{256};
+
+  static constexpr size_t RX_READ_BUF_SIZE = 128;
+  uint8_t rx_read_buf_[RX_READ_BUF_SIZE]{};
+
+  uint32_t rx_time_budget_us_{1500};
+
+  uint32_t frame_timeout_ms_{80};
+  uint32_t frame_max_bytes_seen_{256};
+  uint32_t frame_start_ms_{0};
+  uint32_t frame_bytes_seen_{0};
 
   inline void rb_drop_oldest_() { rb_tail_ = (rb_tail_ + 1) & (RB_SIZE - 1); }
 
@@ -203,6 +207,7 @@ class NextionSimple : public Component {
     if (nh == rb_tail_) {
       rb_overflow_ = true;
       rb_drop_oldest_();
+      rx_rb_drop_count_++;
       nh = (rb_head_ + 1) & (RB_SIZE - 1);
       if (nh == rb_tail_)
         return false;
@@ -237,6 +242,8 @@ class NextionSimple : public Component {
 
   uint32_t diag_deadline_ms_{0};
   bool saw_expected_reply_{false};
+
+  uint32_t diag_timeout_ms_{200};
 
   uint32_t nextion_ready_cooldown_{500};
   uint32_t last_ready_ms_{0};
