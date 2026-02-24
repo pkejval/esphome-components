@@ -29,6 +29,8 @@ class NextionSimple : public Component {
   void set_uart_parent(uart::UARTComponent *parent) { this->uart_parent_ = parent; }
   void set_tft_url(const std::string &tft_url) { this->tft_url_ = tft_url; }
   void set_nextion_ready_cooldown(uint32_t cooldown) { nextion_ready_cooldown_ = cooldown; }
+  void set_health_check_interval(uint32_t interval_ms) { this->health_check_interval_ms_ = interval_ms; }
+  void set_diag_fail_reinit_threshold(uint8_t threshold) { this->diag_fail_reinit_threshold_ = threshold; }
 
   // TX batching tunables (optional)
   void set_tx_max_per_loop(uint8_t v) { this->tx_max_per_loop_ = v; }
@@ -57,6 +59,7 @@ class NextionSimple : public Component {
   // Maintenance
   void reset_nextion();
   void upload_tft();
+  void request_health_check();
   bool is_uploading() const { return this->upload_in_progress_; }
   int get_current_page() const { return this->current_page_; }
 
@@ -85,6 +88,7 @@ class NextionSimple : public Component {
   void request_health_check_();
   void init_tick_();
   void diagnostic_tick_();
+  void service_periodic_health_check_();
 
   // ===== RX =====
   void drain_uart_into_ring_();
@@ -250,6 +254,11 @@ class NextionSimple : public Component {
   bool saw_expected_reply_{false};
 
   uint32_t diag_timeout_ms_{200};
+  uint8_t diag_fail_reinit_threshold_{3};
+  uint8_t diag_fail_streak_{0};
+
+  uint32_t health_check_interval_ms_{0};
+  uint32_t last_health_check_ms_{0};
 
   uint32_t nextion_ready_cooldown_{500};
   uint32_t last_ready_ms_{0};
