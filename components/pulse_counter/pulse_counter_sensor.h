@@ -164,6 +164,9 @@ class PulseCounterSensor : public sensor::Sensor, public PollingComponent {
   void set_falling_edge_mode(PulseCounterCountMode mode) { storage_->falling_edge_mode = mode; }
   void set_filter_us(uint32_t filter) { storage_->filter_us = filter; }
   void set_total_sensor(sensor::Sensor *total_sensor) { total_sensor_ = total_sensor; }
+#if defined(USE_ESP32)
+  void set_use_timer(bool use_timer) { use_timer_ = use_timer; }
+#endif
 
   void set_min_pulses_per_calc(uint32_t n);
   void set_max_accumulation_ms(uint32_t ms);
@@ -197,10 +200,12 @@ class PulseCounterSensor : public sensor::Sensor, public PollingComponent {
   bool custom_tuning_{false};
 
 #if defined(USE_ESP32)
+  bool use_timer_{true};
   esp_timer_handle_t timer_handle_{nullptr};
 
-  std::atomic<float> last_calculated_ppm_{NAN};
   std::atomic<bool> new_value_ready_{false};
+  std::atomic<uint64_t> pending_publish_dt_us_{0};
+  std::atomic<int64_t> pending_publish_pulses_{0};
   std::atomic<int64_t> pending_total_delta_{0};
 
   uint64_t last_tick_us_{0};

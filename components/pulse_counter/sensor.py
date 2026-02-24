@@ -21,6 +21,7 @@ from esphome.const import (
 from esphome.core import CORE
 
 CONF_USE_PCNT = "use_pcnt"
+CONF_USE_TIMER = "use_timer"
 
 LEGACY_ESP32_PCNT_FILTER_LIMIT_US = 12.0   # ESP32 a ESP32-S2
 MODERN_ESP32_PCNT_FILTER_LIMIT_US = 819.0  # ESP32-S3, C3, C6, H2
@@ -114,6 +115,7 @@ CONFIG_SCHEMA = cv.All(
                 validate_count_mode,
             ),
             cv.SplitDefault(CONF_USE_PCNT, esp32=True): cv.boolean,
+            cv.SplitDefault(CONF_USE_TIMER, esp32=True, esp8266=False): cv.boolean,
             cv.Optional(CONF_INTERNAL_FILTER, default="12us"): cv.positive_time_period_microseconds,
             cv.Optional(CONF_TOTAL): sensor.sensor_schema(
                 unit_of_measurement=UNIT_PULSES,
@@ -138,6 +140,9 @@ async def to_code(config):
     count = config[CONF_COUNT_MODE]
     cg.add(var.set_rising_edge_mode(count[CONF_RISING_EDGE]))
     cg.add(var.set_falling_edge_mode(count[CONF_FALLING_EDGE]))
+
+    if CORE.is_esp32:
+        cg.add(var.set_use_timer(config[CONF_USE_TIMER]))
 
     clamped_us = config.get(_CONF_INTERNAL_FILTER_CLAMPED_US)
     if clamped_us is not None:

@@ -344,32 +344,38 @@ void PulseCounterSensor::setup() {
   }
 
 #if defined(USE_ESP32)
-  esp_timer_create_args_t timer_args{};
-  timer_args.callback = &PulseCounterSensor::timer_callback;
-  timer_args.arg = this;
-  timer_args.dispatch_method = ESP_TIMER_TASK;
-  timer_args.name = "pulse_counter";
-
-  esp_err_t err = esp_timer_create(&timer_args, &this->timer_handle_);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "esp_timer_create failed: %s", esp_err_to_name(err));
-    this->mark_failed();
-    return;
-  }
-
-  uint64_t period_us = static_cast<uint64_t>(this->get_update_interval()) * 1000ULL;
-  if (period_us == 0)
-    period_us = 10000ULL;
-
-  err = esp_timer_start_periodic(this->timer_handle_, period_us);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "esp_timer_start_periodic failed: %s", esp_err_to_name(err));
-    this->mark_failed();
-    return;
-  }
-
   this->last_tick_us_ = 0;
+  this->pending_publish_dt_us_.store(0, std::memory_order_relaxed);
+  this->pending_publish_pulses_.store(0, std::memory_order_relaxed);
+  this->new_value_ready_.store(false, std::memory_order_relaxed);
+  this->pending_total_delta_.store(0, std::memory_order_relaxed);
   this->reset_accumulation_();
+
+  if (this->use_timer_) {
+    esp_timer_create_args_t timer_args{};
+    timer_args.callback = &PulseCounterSensor::timer_callback;
+    timer_args.arg = this;
+    timer_args.dispatch_method = ESP_TIMER_TASK;
+    timer_args.name = "pulse_counter";
+
+    esp_err_t err = esp_timer_create(&timer_args, &this->timer_handle_);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "esp_timer_create failed: %s", esp_err_to_name(err));
+      this->mark_failed();
+      return;
+    }
+
+    uint64_t period_us = static_cast<uint64_t>(this->get_update_interval()) * 1000ULL;
+    if (period_us == 0)
+      period_us = 10000ULL;
+
+    err = esp_timer_start_periodic(this->timer_handle_, period_us);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "esp_timer_start_periodic failed: %s", esp_err_to_name(err));
+      this->mark_failed();
+      return;
+    }
+  }
 #endif
 
   if (this->total_sensor_ != nullptr) {
@@ -390,22 +396,43 @@ void PulseCounterSensor::set_update_interval(uint32_t update_interval) {
   }
 
 #if defined(USE_ESP32)
+  this->last_tick_us_ = 0;
+  this->pending_publish_dt_us_.store(0, std::memory_order_relaxed);
+  this->pending_publish_pulses_.store(0, std::memory_order_relaxed);
+  this->new_value_ready_.store(false, std::memory_order_relaxed);
+  this->pending_total_delta_.store(0, std::memory_order_relaxed);
+  this->reset_accumulation_();
+
   if (this->timer_handle_ != nullptr) {
     (void) esp_timer_stop(this->timer_handle_);
+    (void) esp_timer_delete(this->timer_handle_);
+    this->timer_handle_ = nullptr;
+  }
+
+  if (this->use_timer_) {
+    esp_timer_create_args_t timer_args{};
+    timer_args.callback = &PulseCounterSensor::timer_callback;
+    timer_args.arg = this;
+    timer_args.dispatch_method = ESP_TIMER_TASK;
+    timer_args.name = "pulse_counter";
+
+    esp_err_t err = esp_timer_create(&timer_args, &this->timer_handle_);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "esp_timer_create (restart) failed: %s", esp_err_to_name(err));
+      this->mark_failed();
+      return;
+    }
 
     uint64_t period_us = static_cast<uint64_t>(this->get_update_interval()) * 1000ULL;
     if (period_us == 0)
       period_us = 10000ULL;
 
-    const esp_err_t err = esp_timer_start_periodic(this->timer_handle_, period_us);
+    err = esp_timer_start_periodic(this->timer_handle_, period_us);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "esp_timer_start_periodic (restart) failed: %s", esp_err_to_name(err));
       this->mark_failed();
       return;
     }
-
-    this->last_tick_us_ = 0;
-    this->reset_accumulation_();
   }
 #endif
 }
@@ -426,10 +453,18 @@ void PulseCounterSensor::dump_config() {
                 "  Falling Edge: %s\n"
                 "  Filtering pulses shorter than %" PRIu32 " us\n"
                 "  Min pulses per calc: %" PRIu32 "\n"
-                "  Max accumulation (ms): %" PRIu64,
+                "  Max accumulation (ms): %" PRIu64
+#if defined(USE_ESP32)
+                "\n  Use esp_timer: %s"
+#endif
+                ,
                 EDGE_MODE_TO_STRING[this->storage_->rising_edge_mode],
                 EDGE_MODE_TO_STRING[this->storage_->falling_edge_mode], this->storage_->filter_us,
-                this->min_pulses_for_calc_, this->max_accumulation_us_ / 1000ULL);
+                this->min_pulses_for_calc_, this->max_accumulation_us_ / 1000ULL
+#if defined(USE_ESP32)
+                , this->use_timer_ ? "true" : "false"
+#endif
+  );
   LOG_UPDATE_INTERVAL(this);
 }
 
@@ -465,12 +500,9 @@ void PulseCounterSensor::timer_callback(void *arg) {
 
   if (enough_pulses || time_up) {
     if (self->accum_dt_us_ > 0) {
-      const double ppm = (static_cast<double>(self->accum_pulses_) * 60000000.0) /
-                         static_cast<double>(self->accum_dt_us_);
-      if (std::isfinite(ppm) && std::fabs(ppm) < 1e9) {
-        self->last_calculated_ppm_.store(static_cast<float>(ppm), std::memory_order_relaxed);
-        self->new_value_ready_.store(true, std::memory_order_release);
-      }
+      self->pending_publish_pulses_.fetch_add(self->accum_pulses_, std::memory_order_relaxed);
+      self->pending_publish_dt_us_.fetch_add(self->accum_dt_us_, std::memory_order_relaxed);
+      self->new_value_ready_.store(true, std::memory_order_release);
     }
     self->reset_accumulation_();
   }
@@ -479,27 +511,66 @@ void PulseCounterSensor::timer_callback(void *arg) {
 
 void PulseCounterSensor::update() {
 #if defined(USE_ESP32)
-  if (this->new_value_ready_.load(std::memory_order_acquire)) {
-    this->new_value_ready_.store(false, std::memory_order_release);
-    const float ppm = this->last_calculated_ppm_.load(std::memory_order_relaxed);
-    if (std::isfinite(ppm))
-      this->publish_state(ppm);
-  }
+  if (this->use_timer_) {
+    if (this->new_value_ready_.exchange(false, std::memory_order_acq_rel)) {
+      const int64_t pulses = this->pending_publish_pulses_.exchange(0, std::memory_order_acq_rel);
+      const uint64_t dt_us = this->pending_publish_dt_us_.exchange(0, std::memory_order_acq_rel);
+      if (dt_us > 0) {
+        const double ppm = (static_cast<double>(pulses) * 60000000.0) / static_cast<double>(dt_us);
+        if (std::isfinite(ppm) && std::fabs(ppm) < 1e9)
+          this->publish_state(static_cast<float>(ppm));
+      }
+    }
 
-  if (this->total_sensor_ != nullptr) {
-    const int64_t delta = this->pending_total_delta_.exchange(0, std::memory_order_acq_rel);
+    if (this->total_sensor_ != nullptr) {
+      const int64_t delta = this->pending_total_delta_.exchange(0, std::memory_order_acq_rel);
 
-    if (delta != 0 || !this->total_ever_published_) {
-      int64_t abs_total = this->storage_->read_total();
-      if (abs_total < 0)
-        abs_total = 0;
-
-      if (abs_total == 0 && (this->published_total_ != 0 || delta != 0)) {
+      if (delta != 0) {
         this->published_total_ = std::max<int64_t>(0, this->published_total_ + delta);
+        this->total_sensor_->publish_state(static_cast<float>(this->published_total_));
+        this->total_ever_published_ = true;
+      } else if (!this->total_ever_published_) {
+        int64_t abs_total = this->storage_->read_total();
+        if (abs_total < 0)
+          abs_total = 0;
+        this->published_total_ = abs_total;
+        this->total_sensor_->publish_state(static_cast<float>(this->published_total_));
+        this->total_ever_published_ = true;
+      }
+    }
+  } else {
+    const uint64_t t = static_cast<uint64_t>(esp_timer_get_time());
+    const pulse_counter_t delta = this->storage_->read_delta();
+
+    if (this->last_tick_us_ != 0) {
+      const uint64_t dt_us = t - this->last_tick_us_;
+      if (dt_us > 0) {
+        this->accum_dt_us_ += dt_us;
+        if (delta != 0)
+          this->accum_pulses_ += static_cast<int64_t>(delta);
+
+        const bool enough_pulses = (std::llabs(this->accum_pulses_) >= static_cast<int64_t>(this->min_pulses_for_calc_));
+        const bool time_up = (this->accum_dt_us_ >= this->max_accumulation_us_);
+
+        if (enough_pulses || time_up) {
+          const double ppm = (static_cast<double>(this->accum_pulses_) * 60000000.0) / static_cast<double>(this->accum_dt_us_);
+          if (std::isfinite(ppm) && std::fabs(ppm) < 1e9)
+            this->publish_state(static_cast<float>(ppm));
+          this->reset_accumulation_();
+        }
+      }
+    }
+    this->last_tick_us_ = t;
+
+    if (this->total_sensor_ != nullptr && (delta != 0 || !this->total_ever_published_)) {
+      if (delta != 0) {
+        this->published_total_ = std::max<int64_t>(0, this->published_total_ + static_cast<int64_t>(delta));
       } else {
+        int64_t abs_total = this->storage_->read_total();
+        if (abs_total < 0)
+          abs_total = 0;
         this->published_total_ = abs_total;
       }
-
       this->total_sensor_->publish_state(static_cast<float>(this->published_total_));
       this->total_ever_published_ = true;
     }
