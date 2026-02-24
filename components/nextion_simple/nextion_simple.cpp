@@ -485,19 +485,17 @@ bool NextionSimple::txq_push_coalesce_(uint32_t key, const uint8_t *data, size_t
 }
 
 bool NextionSimple::txq_pop_(TxEntry &out) {
-  this->txq_prune_tombstones_();
-  if (this->txq_head_ == this->txq_tail_)
-    return false;
+  while (true) {
+    this->txq_prune_tombstones_();
+    if (this->txq_head_ == this->txq_tail_)
+      return false;
 
-  out = this->txq_[this->txq_tail_];
-  this->txq_tail_ = (this->txq_tail_ + 1) & (TXQ_SIZE - 1);
+    out = this->txq_[this->txq_tail_];
+    this->txq_tail_ = (this->txq_tail_ + 1) & (TXQ_SIZE - 1);
 
-  // If it was a tombstone, skip it
-  if (out.len == 0) {
-    return this->txq_pop_(out);
+    if (out.len != 0)
+      return true;
   }
-
-  return true;
 }
 
 void NextionSimple::txq_log_overflow_if_needed_() {
@@ -517,14 +515,22 @@ void NextionSimple::tx_flush_() {
   if (this->uart_parent_ == nullptr)
     return;
 
-  const uint32_t start_us = micros();
+  if (this->txq_head_ == this->txq_tail_) {
+    this->txq_log_overflow_if_needed_();
+    return;
+  }
+
+  const uint32_t deadline_us = micros() + this->tx_time_budget_us_;
   uint8_t sent = 0;
 
   TxEntry e{};
-  while (sent < this->tx_max_per_loop_ && this->txq_pop_(e)) {
-    if ((micros() - start_us) >= this->tx_time_budget_us_) {
-      // Budget exceeded; we still send this popped entry (no requeue).
-    }
+  while (sent < this->tx_max_per_loop_) {
+    if (static_cast<int32_t>(micros() - deadline_us) >= 0)
+      break;
+
+    if (!this->txq_pop_(e))
+      break;
+
     this->uart_parent_->write_array(e.data, e.len);
     sent++;
   }
