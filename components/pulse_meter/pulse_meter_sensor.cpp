@@ -238,23 +238,51 @@ void PulseMeterSensor::loop() {
       uint32_t last_edge_us = tdet;
       uint32_t last_rise_us = trise;
 
+      uint64_t total_ticks = 0;
+      for (size_t i = 0; i < local_sym_count; ++i) {
+        total_ticks += local_syms[i].duration0;
+        total_ticks += local_syms[i].duration1;
+      }
+
+      const bool rmt_is_us = this->rmt_resolution_hz_ == 1000000UL;
+      const auto ticks_to_us = [this, rmt_is_us](uint64_t ticks) -> uint32_t {
+        if (rmt_is_us) {
+          return static_cast<uint32_t>(ticks);
+        }
+        return static_cast<uint32_t>((ticks * 1000000ULL) / this->rmt_resolution_hz_);
+      };
+      const auto us_to_ticks_ceil = [this, rmt_is_us](uint32_t us) -> uint32_t {
+        if (rmt_is_us) {
+          return us;
+        }
+        return static_cast<uint32_t>(((uint64_t) us * this->rmt_resolution_hz_ + 1000000ULL - 1ULL) / 1000000ULL);
+      };
+
+      const uint32_t min_low_ticks = us_to_ticks_ceil(this->min_low_us_);
+      const uint32_t min_high_ticks = us_to_ticks_ceil(this->min_high_us_);
+      const uint32_t total_us = ticks_to_us(total_ticks);
+      const uint32_t frame_start_us = now - total_us;
+      uint64_t elapsed_ticks = 0;
+
       uint32_t add_cnt = 0;
 
       for (size_t i = 0; i < local_sym_count; ++i) {
         const auto &w = local_syms[i];
 
         const bool lvl0 = w.level0;
-        const uint32_t dur0_us = w.duration0;
+        const uint32_t dur0_ticks = w.duration0;
+        elapsed_ticks += dur0_ticks;
         if (lvl0 != last_pin) {
           if (!last_pin) {
-            if (dur0_us >= this->min_low_us_) {
+            if (dur0_ticks >= min_low_ticks) {
               latched = false;
             }
           } else {
-            if (dur0_us >= this->min_high_us_) {
+            if (dur0_ticks >= min_high_ticks) {
               latched = true;
-              last_edge_us = now;
-              last_rise_us = now;
+              const uint32_t edge_us = frame_start_us + ticks_to_us(elapsed_ticks);
+              last_edge_us = edge_us;
+              last_rise_us = edge_us;
               add_cnt++;
             }
           }
@@ -262,17 +290,19 @@ void PulseMeterSensor::loop() {
         }
 
         const bool lvl1 = w.level1;
-        const uint32_t dur1_us = w.duration1;
+        const uint32_t dur1_ticks = w.duration1;
+        elapsed_ticks += dur1_ticks;
         if (lvl1 != last_pin) {
           if (!last_pin) {
-            if (dur1_us >= this->min_low_us_) {
+            if (dur1_ticks >= min_low_ticks) {
               latched = false;
             }
           } else {
-            if (dur1_us >= this->min_high_us_) {
+            if (dur1_ticks >= min_high_ticks) {
               latched = true;
-              last_edge_us = now;
-              last_rise_us = now;
+              const uint32_t edge_us = frame_start_us + ticks_to_us(elapsed_ticks);
+              last_edge_us = edge_us;
+              last_rise_us = edge_us;
               add_cnt++;
             }
           }
@@ -424,14 +454,15 @@ void IRAM_ATTR PulseMeterSensor::pulse_intr(PulseMeterSensor *sensor) {
   auto &st = sensor->pulse_state_;
   auto &set = *sensor->set_;
 
-  const bool long_enough = (now - st.last_intr_) >= sensor->filter_us_;
+  const uint32_t delta_us = now - st.last_intr_;
+  const bool long_enough = delta_us >= sensor->filter_us_;
 
   if (long_enough && st.latched_ && !st.last_pin_val_) {
-    if ((now - st.last_intr_) >= sensor->min_low_us_) {
+    if (delta_us >= sensor->min_low_us_) {
       st.latched_ = false;
     }
   } else if (long_enough && !st.latched_ && st.last_pin_val_) {
-    if ((now - st.last_intr_) >= sensor->min_high_us_) {
+    if (delta_us >= sensor->min_high_us_) {
       st.latched_ = true;
       set.last_detected_edge_us_ = st.last_intr_;
       set.count_ = set.count_ + 1;
@@ -439,7 +470,9 @@ void IRAM_ATTR PulseMeterSensor::pulse_intr(PulseMeterSensor *sensor) {
     }
   }
 
-  set.last_rising_edge_us_ = (!st.latched_ && pin_val) ? now : set.last_detected_edge_us_;
+  if (!st.latched_ && pin_val) {
+    set.last_rising_edge_us_ = now;
+  }
 
   st.last_intr_ = now;
   st.last_pin_val_ = pin_val;
