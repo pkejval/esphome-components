@@ -37,6 +37,8 @@ void NextionSimple::dump_config() {
   ESP_LOGCONFIG(TAG, "  TX batching: queue=%u, max_per_loop=%u, budget=%" PRIu32 "us",
                 static_cast<unsigned>(TXQ_SIZE), static_cast<unsigned>(this->tx_max_per_loop_),
                 static_cast<uint32_t>(this->tx_time_budget_us_));
+  ESP_LOGCONFIG(TAG, "  Health check interval: %" PRIu32 " ms", static_cast<uint32_t>(this->health_check_interval_ms_));
+  ESP_LOGCONFIG(TAG, "  Diag fail reinit threshold: %u", static_cast<unsigned>(this->diag_fail_reinit_threshold_));
 }
 
 void NextionSimple::setup() {
@@ -68,6 +70,7 @@ void NextionSimple::loop() {
       break;
 
     case NxMode::RUN_WRITEONLY:
+      this->service_periodic_health_check_();
       break;
 
     case NxMode::DIAG_CHECK:
@@ -114,11 +117,14 @@ void NextionSimple::drain_uart_into_ring_() {
   if (!this->rx_enabled_ || this->uart_parent_ == nullptr)
     return;
 
-  const uint32_t start_us = micros();
+  const uint32_t deadline_us = micros() + this->rx_time_budget_us_;
   uint32_t drained = 0;
 
-  while (this->uart_parent_->available() && drained < this->rx_drain_max_per_loop_) {
-    if ((micros() - start_us) >= this->rx_time_budget_us_)
+  while (drained < this->rx_drain_max_per_loop_) {
+    if (static_cast<int32_t>(micros() - deadline_us) >= 0)
+      break;
+
+    if (!this->uart_parent_->available())
       break;
 
     size_t avail = static_cast<size_t>(this->uart_parent_->available());
@@ -156,15 +162,16 @@ void NextionSimple::drain_uart_into_ring_() {
     drained += static_cast<uint32_t>(to_read);
   }
 
-  this->log_rx_drops_if_needed_();
+  if (this->rx_rb_drop_count_ != 0 || this->rx_frame_drop_count_ != 0)
+    this->log_rx_drops_if_needed_();
 }
 
 bool NextionSimple::parse_from_ring_(RxFilter filter) {
-  const uint32_t start_us = micros();
+  const uint32_t deadline_us = micros() + this->rx_time_budget_us_;
   uint8_t b;
 
   while (this->rb_pop_(b)) {
-    if ((micros() - start_us) >= this->rx_time_budget_us_) {
+    if (static_cast<int32_t>(micros() - deadline_us) >= 0) {
       return false;
     }
 
@@ -184,9 +191,8 @@ bool NextionSimple::parse_from_ring_(RxFilter filter) {
     }
 
     this->frame_bytes_seen_++;
-    const uint32_t now_ms = millis();
-    if ((now_ms - this->frame_start_ms_) > this->frame_timeout_ms_ ||
-        this->frame_bytes_seen_ > this->frame_max_bytes_seen_) {
+    if (this->frame_bytes_seen_ > this->frame_max_bytes_seen_ ||
+        ((this->frame_bytes_seen_ & 0x07U) == 0U && (millis() - this->frame_start_ms_) > this->frame_timeout_ms_)) {
       this->in_frame_ = false;
       this->frame_len_ = 0;
       this->ff_term_ = 0;
@@ -289,6 +295,7 @@ void NextionSimple::init_tick_() {
 void NextionSimple::start_init_handshake_() {
   this->mode_ = NxMode::INIT;
   this->rx_enabled_ = true;
+  this->diag_fail_streak_ = 0;
   this->handshake_done_ = false;
   this->saw_expected_reply_ = false;
   this->reset_rx_state_();
@@ -316,6 +323,22 @@ void NextionSimple::enter_writeonly_mode_() {
     this->last_ready_ms_ = now;
     this->on_nextion_ready_callback_.call();
   }
+}
+
+void NextionSimple::request_health_check() {
+  this->request_health_check_();
+}
+
+void NextionSimple::service_periodic_health_check_() {
+  if (this->health_check_interval_ms_ == 0)
+    return;
+
+  const uint32_t now = millis();
+  if (now - this->last_health_check_ms_ < this->health_check_interval_ms_)
+    return;
+
+  this->last_health_check_ms_ = now;
+  this->request_health_check_();
 }
 
 void NextionSimple::request_health_check_() {
@@ -348,12 +371,27 @@ void NextionSimple::diagnostic_tick_() {
   (void) this->parse_from_ring_(RxFilter::DIAG_ONLY);
 
   if (this->saw_expected_reply_ || millis() >= this->diag_deadline_ms_) {
+    if (this->saw_expected_reply_) {
+      this->diag_fail_streak_ = 0;
+    } else {
+      this->diag_fail_streak_++;
+      ESP_LOGW(TAG, "Health check timeout (%u/%u)", static_cast<unsigned>(this->diag_fail_streak_),
+               static_cast<unsigned>(this->diag_fail_reinit_threshold_));
+    }
+
     if (this->bkcmd_ != 0) {
       this->send_command_printf("bkcmd=0");
       this->bkcmd_ = 0;
     }
     this->rx_enabled_ = false;
     this->reset_rx_state_();
+
+    if (this->diag_fail_reinit_threshold_ != 0 && this->diag_fail_streak_ >= this->diag_fail_reinit_threshold_) {
+      ESP_LOGW(TAG, "Repeated health-check failures, restarting Nextion handshake");
+      this->start_init_handshake_();
+      return;
+    }
+
     this->mode_ = NxMode::RUN_WRITEONLY;
   }
 }
@@ -408,10 +446,16 @@ bool NextionSimple::txq_try_replace_same_epoch_move_to_back_(uint32_t key, const
 
   // Replace only if same epoch (no crossing barriers), and move-to-back:
   // we "tombstone" old entry and enqueue a fresh one at the end.
-  size_t i = this->txq_tail_;
-  while (i != this->txq_head_) {
+  // Scan from newest to oldest to hit hot keys faster and stop when we cross into an older epoch.
+  size_t i = this->txq_head_;
+  while (i != this->txq_tail_) {
+    i = (i - 1) & (TXQ_SIZE - 1);
     auto &slot = this->txq_[i];
-    if (slot.len != 0 && slot.coalesce == 1 && slot.key == key && slot.epoch == this->tx_epoch_) {
+
+    if (slot.len != 0 && slot.epoch != this->tx_epoch_)
+      break;
+
+    if (slot.len != 0 && slot.coalesce == 1 && slot.key == key) {
       slot.len = 0;  // tombstone (skip later)
 
       this->txq_prune_tombstones_();
@@ -441,8 +485,6 @@ bool NextionSimple::txq_try_replace_same_epoch_move_to_back_(uint32_t key, const
       this->txq_head_ = nh;
       return true;
     }
-
-    i = (i + 1) & (TXQ_SIZE - 1);
   }
 
   return false;
@@ -485,19 +527,17 @@ bool NextionSimple::txq_push_coalesce_(uint32_t key, const uint8_t *data, size_t
 }
 
 bool NextionSimple::txq_pop_(TxEntry &out) {
-  this->txq_prune_tombstones_();
-  if (this->txq_head_ == this->txq_tail_)
-    return false;
+  while (true) {
+    this->txq_prune_tombstones_();
+    if (this->txq_head_ == this->txq_tail_)
+      return false;
 
-  out = this->txq_[this->txq_tail_];
-  this->txq_tail_ = (this->txq_tail_ + 1) & (TXQ_SIZE - 1);
+    out = this->txq_[this->txq_tail_];
+    this->txq_tail_ = (this->txq_tail_ + 1) & (TXQ_SIZE - 1);
 
-  // If it was a tombstone, skip it
-  if (out.len == 0) {
-    return this->txq_pop_(out);
+    if (out.len != 0)
+      return true;
   }
-
-  return true;
 }
 
 void NextionSimple::txq_log_overflow_if_needed_() {
@@ -517,14 +557,22 @@ void NextionSimple::tx_flush_() {
   if (this->uart_parent_ == nullptr)
     return;
 
-  const uint32_t start_us = micros();
+  if (this->txq_head_ == this->txq_tail_) {
+    this->txq_log_overflow_if_needed_();
+    return;
+  }
+
+  const uint32_t deadline_us = micros() + this->tx_time_budget_us_;
   uint8_t sent = 0;
 
   TxEntry e{};
-  while (sent < this->tx_max_per_loop_ && this->txq_pop_(e)) {
-    if ((micros() - start_us) >= this->tx_time_budget_us_) {
-      // Budget exceeded; we still send this popped entry (no requeue).
-    }
+  while (sent < this->tx_max_per_loop_) {
+    if (static_cast<int32_t>(micros() - deadline_us) >= 0)
+      break;
+
+    if (!this->txq_pop_(e))
+      break;
+
     this->uart_parent_->write_array(e.data, e.len);
     sent++;
   }

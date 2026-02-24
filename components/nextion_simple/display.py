@@ -47,6 +47,8 @@ CONF_ON_SETUP = "on_setup"
 CONF_ON_PAGE = "on_page"
 CONF_ON_NEXTION_READY = "on_nextion_ready"
 CONF_NEXTION_READY_COOLDOWN = "nextion_ready_cooldown"
+CONF_HEALTH_CHECK_INTERVAL = "health_check_interval"
+CONF_DIAG_FAIL_REINIT_THRESHOLD = "diag_fail_reinit_threshold"
 
 CONF_PAGE = "page"
 CONF_COMPONENT = "component"
@@ -79,6 +81,10 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(
             CONF_NEXTION_READY_COOLDOWN, default="500ms"
         ): cv.positive_time_period_milliseconds,
+        cv.Optional(
+            CONF_HEALTH_CHECK_INTERVAL, default="0s"
+        ): cv.positive_time_period_milliseconds,
+        cv.Optional(CONF_DIAG_FAIL_REINIT_THRESHOLD, default=3): cv.int_range(min=0, max=20),
     }
 )
 
@@ -99,6 +105,10 @@ async def to_code(config):
                 int(config["nextion_ready_cooldown"].total_milliseconds)
             )
         )
+    if CONF_HEALTH_CHECK_INTERVAL in config:
+        cg.add(var.set_health_check_interval(int(config[CONF_HEALTH_CHECK_INTERVAL].total_milliseconds)))
+    if CONF_DIAG_FAIL_REINIT_THRESHOLD in config:
+        cg.add(var.set_diag_fail_reinit_threshold(config[CONF_DIAG_FAIL_REINIT_THRESHOLD]))
 
     if "on_setup" in config:
         for conf in config["on_setup"]:
