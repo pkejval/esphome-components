@@ -30,10 +30,6 @@ class NextionSimple : public Component {
   void set_tft_url(const std::string &tft_url) { this->tft_url_ = tft_url; }
   void set_nextion_ready_cooldown(uint32_t cooldown) { nextion_ready_cooldown_ = cooldown; }
 
-  // TX batching tunables (optional)
-  void set_tx_max_per_loop(uint8_t v) { this->tx_max_per_loop_ = v; }
-  void set_tx_time_budget_us(uint32_t v) { this->tx_time_budget_us_ = v; }
-
   // High-level API
   void set_component_value(const std::string &component_name, float value);
   void set_component_text(const std::string &component_name, const std::string &text,
@@ -76,7 +72,7 @@ class NextionSimple : public Component {
 
   bool prepare_nextion_for_upload_idf_(uint32_t baud_rate);
   bool wait_for_ack_idf_(uint32_t timeout_ms, std::string &out);
-  int upload_by_chunks_idf_(void *http_client, uint32_t &range_start);
+  int upload_by_chunks_idf_(void *http_client, uint32_t &range_start, uint8_t *buffer, size_t buffer_size);
 
   // ===== Modes =====
   enum class NxMode : uint8_t { INIT, RUN_WRITEONLY, DIAG_CHECK };
@@ -119,6 +115,7 @@ class NextionSimple : public Component {
   };
 
   static uint32_t fnv1a32_(const char *s);
+  static uint32_t fnv1a32_bytes_(const uint8_t *data, size_t len);
   static uint32_t make_coalesce_key_(uint32_t comp_hash, TxCoalesceKind kind);
 
   struct TxEntry {
@@ -131,12 +128,23 @@ class NextionSimple : public Component {
 
   static constexpr size_t TXQ_SIZE = 32;
   static_assert((TXQ_SIZE & (TXQ_SIZE - 1)) == 0, "TXQ_SIZE must be power of two");
+  static constexpr size_t TX_DEDUP_SIZE = 64;
+  static_assert((TX_DEDUP_SIZE & (TX_DEDUP_SIZE - 1)) == 0, "TX_DEDUP_SIZE must be power of two");
+
+  struct TxDedupEntry {
+    uint32_t key{0};
+    uint32_t payload_hash{0};
+    uint16_t payload_len{0};
+  };
 
   void txq_prune_tombstones_();
+  void txq_dedup_clear_();
+  bool txq_should_skip_unchanged_(uint32_t key, const uint8_t *data, size_t len);
+  void txq_dedup_store_(uint32_t key, const uint8_t *data, size_t len);
 
   bool txq_push_raw_barrier_(const uint8_t *data, size_t len);
   bool txq_push_coalesce_(uint32_t key, const uint8_t *data, size_t len);
-  bool txq_try_replace_same_epoch_move_to_back_(uint32_t key, const uint8_t *data, size_t len);
+  size_t txq_tombstone_same_epoch_(uint32_t key);
   bool txq_pop_(TxEntry &out);
   void txq_log_overflow_if_needed_();
   void tx_flush_();
@@ -147,6 +155,7 @@ class NextionSimple : public Component {
   TxEntry txq_[TXQ_SIZE]{};
   size_t txq_head_{0};
   size_t txq_tail_{0};
+  TxDedupEntry tx_dedup_[TX_DEDUP_SIZE]{};
 
   uint32_t tx_epoch_{1};
 

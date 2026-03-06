@@ -27,6 +27,17 @@ uint32_t NextionSimple::fnv1a32_(const char *s) {
   return h;
 }
 
+uint32_t NextionSimple::fnv1a32_bytes_(const uint8_t *data, size_t len) {
+  if (data == nullptr || len == 0)
+    return 0;
+  uint32_t h = 2166136261u;
+  for (size_t i = 0; i < len; i++) {
+    h ^= data[i];
+    h *= 16777619u;
+  }
+  return h;
+}
+
 uint32_t NextionSimple::make_coalesce_key_(uint32_t comp_hash, TxCoalesceKind kind) {
   return ((comp_hash ^ (comp_hash >> 16) ^ (comp_hash >> 8)) << 8) | static_cast<uint32_t>(kind);
 }
@@ -291,6 +302,7 @@ void NextionSimple::start_init_handshake_() {
   this->rx_enabled_ = true;
   this->handshake_done_ = false;
   this->saw_expected_reply_ = false;
+  this->txq_dedup_clear_();
   this->reset_rx_state_();
   this->init_deadline_ms_ = millis() + 3000;
 
@@ -308,6 +320,7 @@ void NextionSimple::enter_writeonly_mode_() {
   }
 
   this->rx_enabled_ = false;
+  this->txq_dedup_clear_();
   this->reset_rx_state_();
   this->mode_ = NxMode::RUN_WRITEONLY;
 
@@ -366,12 +379,57 @@ void NextionSimple::txq_prune_tombstones_() {
   }
 }
 
+void NextionSimple::txq_dedup_clear_() { memset(this->tx_dedup_, 0, sizeof(this->tx_dedup_)); }
+
+bool NextionSimple::txq_should_skip_unchanged_(uint32_t key, const uint8_t *data, size_t len) {
+  if (key == 0 || data == nullptr || len == 0)
+    return false;
+
+  const uint32_t payload_hash = fnv1a32_bytes_(data, len);
+  size_t idx = key & (TX_DEDUP_SIZE - 1);
+  for (size_t i = 0; i < TX_DEDUP_SIZE; i++) {
+    const auto &entry = this->tx_dedup_[idx];
+    if (entry.key == 0)
+      return false;
+    if (entry.key == key) {
+      return entry.payload_hash == payload_hash && entry.payload_len == len;
+    }
+    idx = (idx + 1) & (TX_DEDUP_SIZE - 1);
+  }
+
+  return false;
+}
+
+void NextionSimple::txq_dedup_store_(uint32_t key, const uint8_t *data, size_t len) {
+  if (key == 0 || data == nullptr || len == 0)
+    return;
+
+  const uint32_t payload_hash = fnv1a32_bytes_(data, len);
+  size_t idx = key & (TX_DEDUP_SIZE - 1);
+  for (size_t i = 0; i < TX_DEDUP_SIZE; i++) {
+    auto &entry = this->tx_dedup_[idx];
+    if (entry.key == 0 || entry.key == key) {
+      entry.key = key;
+      entry.payload_hash = payload_hash;
+      entry.payload_len = static_cast<uint16_t>(len);
+      return;
+    }
+    idx = (idx + 1) & (TX_DEDUP_SIZE - 1);
+  }
+
+  auto &entry = this->tx_dedup_[key & (TX_DEDUP_SIZE - 1)];
+  entry.key = key;
+  entry.payload_hash = payload_hash;
+  entry.payload_len = static_cast<uint16_t>(len);
+}
+
 bool NextionSimple::txq_push_raw_barrier_(const uint8_t *data, size_t len) {
   if (data == nullptr || len == 0)
     return false;
 
   // Raw command acts as barrier: new epoch
   this->tx_epoch_++;
+  this->txq_dedup_clear_();
 
   this->txq_prune_tombstones_();
 
@@ -402,58 +460,57 @@ bool NextionSimple::txq_push_raw_barrier_(const uint8_t *data, size_t len) {
   return true;
 }
 
-bool NextionSimple::txq_try_replace_same_epoch_move_to_back_(uint32_t key, const uint8_t *data, size_t len) {
-  if (key == 0 || data == nullptr || len == 0)
-    return false;
+size_t NextionSimple::txq_tombstone_same_epoch_(uint32_t key) {
+  if (key == 0)
+    return 0;
 
-  // Replace only if same epoch (no crossing barriers), and move-to-back:
-  // we "tombstone" old entry and enqueue a fresh one at the end.
+  size_t removed = 0;
   size_t i = this->txq_tail_;
   while (i != this->txq_head_) {
     auto &slot = this->txq_[i];
     if (slot.len != 0 && slot.coalesce == 1 && slot.key == key && slot.epoch == this->tx_epoch_) {
-      slot.len = 0;  // tombstone (skip later)
-
-      this->txq_prune_tombstones_();
-
-      size_t nh = (this->txq_head_ + 1) & (TXQ_SIZE - 1);
-      if (nh == this->txq_tail_) {
-        this->txq_tail_ = (this->txq_tail_ + 1) & (TXQ_SIZE - 1);
-        this->txq_prune_tombstones_();
-        this->txq_drop_count_++;
-        this->txq_overflow_ = true;
-
-        nh = (this->txq_head_ + 1) & (TXQ_SIZE - 1);
-        if (nh == this->txq_tail_) {
-          return true;  // old entry was tombstoned; worst case we drop this update silently
-        }
-      }
-
-      auto &dst = this->txq_[this->txq_head_];
-      if (len > sizeof(dst.data))
-        len = sizeof(dst.data);
-      memcpy(dst.data, data, len);
-      dst.len = static_cast<uint16_t>(len);
-      dst.key = key;
-      dst.coalesce = 1;
-      dst.epoch = this->tx_epoch_;
-
-      this->txq_head_ = nh;
-      return true;
+      slot.len = 0;
+      removed++;
     }
 
     i = (i + 1) & (TXQ_SIZE - 1);
   }
 
-  return false;
+  if (removed != 0) {
+    this->txq_prune_tombstones_();
+  }
+
+  return removed;
 }
 
 bool NextionSimple::txq_push_coalesce_(uint32_t key, const uint8_t *data, size_t len) {
   if (data == nullptr || len == 0)
     return false;
 
-  if (key != 0 && this->txq_try_replace_same_epoch_move_to_back_(key, data, len)) {
-    return true;
+  if (key != 0) {
+    bool pending_same = false;
+    bool pending_diff = false;
+    size_t i = this->txq_tail_;
+    while (i != this->txq_head_) {
+      const auto &slot = this->txq_[i];
+      if (slot.len != 0 && slot.coalesce == 1 && slot.key == key && slot.epoch == this->tx_epoch_) {
+        if (slot.len == len && memcmp(slot.data, data, len) == 0) {
+          pending_same = true;
+        } else {
+          pending_diff = true;
+        }
+      }
+      i = (i + 1) & (TXQ_SIZE - 1);
+    }
+
+    if (pending_same && !pending_diff) {
+      return true;
+    }
+    if (!pending_same && !pending_diff && this->txq_should_skip_unchanged_(key, data, len)) {
+      return true;
+    }
+
+    (void) this->txq_tombstone_same_epoch_(key);
   }
 
   this->txq_prune_tombstones_();
@@ -523,6 +580,16 @@ void NextionSimple::tx_flush_() {
   const uint32_t deadline_us = micros() + this->tx_time_budget_us_;
   uint8_t sent = 0;
 
+  // Batch multiple queued commands into fewer UART writes to reduce driver overhead.
+  uint8_t batch[384];
+  size_t batch_len = 0;
+  auto flush_batch = [&]() {
+    if (batch_len == 0)
+      return;
+    this->uart_parent_->write_array(batch, batch_len);
+    batch_len = 0;
+  };
+
   TxEntry e{};
   while (sent < this->tx_max_per_loop_) {
     if (static_cast<int32_t>(micros() - deadline_us) >= 0)
@@ -531,9 +598,30 @@ void NextionSimple::tx_flush_() {
     if (!this->txq_pop_(e))
       break;
 
-    this->uart_parent_->write_array(e.data, e.len);
+    const size_t e_len = e.len;
+    if (e_len > sizeof(batch)) {
+      flush_batch();
+      this->uart_parent_->write_array(e.data, e_len);
+      if (e.coalesce == 1 && e.key != 0) {
+        this->txq_dedup_store_(e.key, e.data, e_len);
+      }
+      sent++;
+      continue;
+    }
+
+    if (batch_len + e_len > sizeof(batch)) {
+      flush_batch();
+    }
+
+    memcpy(batch + batch_len, e.data, e_len);
+    batch_len += e_len;
+    if (e.coalesce == 1 && e.key != 0) {
+      this->txq_dedup_store_(e.key, e.data, e_len);
+    }
     sent++;
   }
+
+  flush_batch();
 
   this->txq_log_overflow_if_needed_();
 }

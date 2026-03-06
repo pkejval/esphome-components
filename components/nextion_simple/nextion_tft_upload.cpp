@@ -477,11 +477,17 @@ bool NextionSimple::prepare_nextion_for_upload_idf_(uint32_t baud_rate) {
 }
 
 // Range upload (HEAD → GET s Range) – převod z originálu na naši třídu
-int NextionSimple::upload_by_chunks_idf_(void *http_client_v, uint32_t &range_start) {
+int NextionSimple::upload_by_chunks_idf_(void *http_client_v, uint32_t &range_start, uint8_t *buffer,
+                                         size_t buffer_size) {
   auto http = reinterpret_cast<esp_http_client_handle_t>(http_client_v);
 
   if (range_start >= this->tft_size_) {
     ESP_LOGW(TAG, "Range start beyond EOF");
+    return -1;
+  }
+
+  if (buffer == nullptr || buffer_size == 0) {
+    ESP_LOGE(TAG, "Upload buffer is not available");
     return -1;
   }
 
@@ -521,24 +527,17 @@ int NextionSimple::upload_by_chunks_idf_(void *http_client_v, uint32_t &range_st
     return -1;
   }
 
-  uint8_t *buffer = (uint8_t *) heap_caps_malloc(4096, MALLOC_CAP_DEFAULT);
-  if (!buffer) {
-    ESP_LOGE(TAG, "Failed to allocate upload buffer");
-    esp_http_client_close(http);
-    return -1;
-  }
-
   uint32_t remain = want32;
   while (remain > 0) {
     App.feed_wdt();
-    const uint16_t chunk = (remain > 4096u) ? 4096u : (uint16_t) remain;
+    const size_t chunk = (remain > buffer_size) ? buffer_size : static_cast<size_t>(remain);
 
-    uint16_t read_len = 0;
+    size_t read_len = 0;
     uint8_t retries = 0;
     while (retries < 5 && read_len < chunk) {
-      int r = esp_http_client_read(http, reinterpret_cast<char *>(buffer) + read_len, chunk - read_len);
+      int r = esp_http_client_read(http, reinterpret_cast<char *>(buffer) + read_len, static_cast<int>(chunk - read_len));
       if (r > 0) {
-        read_len += (uint16_t) r;
+        read_len += static_cast<size_t>(r);
         retries = 0;
       } else {
         retries++;
@@ -547,8 +546,7 @@ int NextionSimple::upload_by_chunks_idf_(void *http_client_v, uint32_t &range_st
       App.feed_wdt();
     }
     if (read_len != chunk) {
-      ESP_LOGE(TAG, "Short read: %u of %u", (unsigned) read_len, (unsigned) chunk);
-      free(buffer);
+      ESP_LOGE(TAG, "Short read: %u of %u", static_cast<unsigned>(read_len), static_cast<unsigned>(chunk));
       esp_http_client_close(http);
       return -1;
     }
@@ -566,8 +564,8 @@ int NextionSimple::upload_by_chunks_idf_(void *http_client_v, uint32_t &range_st
 #endif
     }
 
-    remain -= read_len;
-    this->content_length_ -= read_len;
+    remain -= static_cast<uint32_t>(read_len);
+    this->content_length_ -= static_cast<uint32_t>(read_len);
   }
 
   // po bloku čekáme na ACK (0x05 OK / 0x08 resume)
@@ -575,7 +573,6 @@ int NextionSimple::upload_by_chunks_idf_(void *http_client_v, uint32_t &range_st
   this->wait_for_ack_idf_(upload_first_chunk_sent_ ? 500 : 5000, ack);
   upload_first_chunk_sent_ = true;
 
-  free(buffer);
   esp_http_client_close(http);
 
   if (!ack.empty()) {
@@ -591,7 +588,7 @@ int NextionSimple::upload_by_chunks_idf_(void *http_client_v, uint32_t &range_st
       }
       this->content_length_ = this->tft_size_ - result;
       range_start = result;
-      return (int) range_start;
+      return static_cast<int>(range_start);
     } else if (ab[0] != 0x05 && ab[0] != 0x08) {
       ESP_LOGE(TAG, "Invalid ACK: [%s]",
                format_hex_pretty(reinterpret_cast<const uint8_t *>(ack.data()), ack.size()).c_str());
@@ -613,7 +610,7 @@ int NextionSimple::upload_by_chunks_idf_(void *http_client_v, uint32_t &range_st
            (uint32_t) esp_get_free_heap_size());
 #endif
 
-  return (int) range_start;
+  return static_cast<int>(range_start);
 }
 
 bool NextionSimple::upload_tft_esp_idf_() {
@@ -782,11 +779,29 @@ bool NextionSimple::upload_tft_esp_idf_() {
   uint32_t position = 0;
   this->upload_first_chunk_sent_ = false;
 
+  uint8_t *upload_buffer = (uint8_t *) heap_caps_malloc(4096, MALLOC_CAP_DEFAULT);
+  if (upload_buffer == nullptr) {
+    ESP_LOGE(TAG, "Failed to allocate upload buffer");
+    esp_http_client_close(http);
+    esp_http_client_cleanup(http);
+
+    uint32_t cur = this->uart_parent_->get_baud_rate();
+    if (cur != this->original_baud_rate_) {
+      this->uart_parent_->set_baud_rate(this->original_baud_rate_);
+      this->uart_parent_->load_settings();
+    }
+
+    this->is_updating_ = false;
+    this->upload_in_progress_ = false;
+    return false;
+  }
+
   while (this->content_length_ > 0) {
-    int r = this->upload_by_chunks_idf_(http, position);
+    int r = this->upload_by_chunks_idf_(http, position, upload_buffer, 4096u);
     if (r < 0) {
       ESP_LOGE(TAG, "Upload failed");
 
+      free(upload_buffer);
       esp_http_client_close(http);
       esp_http_client_cleanup(http);
 
@@ -806,6 +821,8 @@ bool NextionSimple::upload_tft_esp_idf_() {
     }
     App.feed_wdt();
   }
+
+  free(upload_buffer);
 
   ESP_LOGI(TAG, "TFT upload successful");
 
