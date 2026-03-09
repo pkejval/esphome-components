@@ -115,39 +115,53 @@ class NextionSimple : public Component {
   };
 
   static uint32_t fnv1a32_(const char *s);
-  static uint32_t fnv1a32_bytes_(const uint8_t *data, size_t len);
   static uint32_t make_coalesce_key_(uint32_t comp_hash, TxCoalesceKind kind);
 
   struct TxEntry {
     uint16_t len{0};              // len==0 => tombstone / skipped
     uint8_t data[256 + 3]{};
-    uint32_t key{0};              // 0 => not coalescable
     uint32_t epoch{0};            // barrier epoch
-    uint8_t coalesce{0};          // 1 => coalescable
   };
 
   static constexpr size_t TXQ_SIZE = 32;
   static_assert((TXQ_SIZE & (TXQ_SIZE - 1)) == 0, "TXQ_SIZE must be power of two");
-  static constexpr size_t TX_DEDUP_SIZE = 64;
-  static_assert((TX_DEDUP_SIZE & (TX_DEDUP_SIZE - 1)) == 0, "TX_DEDUP_SIZE must be power of two");
+  static constexpr size_t TX_MIRROR_SIZE = 64;
+  static_assert((TX_MIRROR_SIZE & (TX_MIRROR_SIZE - 1)) == 0, "TX_MIRROR_SIZE must be power of two");
 
-  struct TxDedupEntry {
+  enum class TxMirrorKind : uint8_t {
+    NONE = 0,
+    PROP_INT = 1,
+    VIS = 2,
+    TXT = 3,
+  };
+
+  struct TxMirrorEntry {
+    bool used{false};
+    bool dirty{false};
     uint32_t key{0};
-    uint32_t payload_hash{0};
-    uint16_t payload_len{0};
+    uint32_t epoch{0};
+    TxMirrorKind kind{TxMirrorKind::NONE};
+    std::string component;
+    std::string prop;
+    std::string text;
+    int int_value{0};
   };
 
   void txq_prune_tombstones_();
-  void txq_dedup_clear_();
-  bool txq_should_skip_unchanged_(uint32_t key, const uint8_t *data, size_t len);
-  void txq_dedup_store_(uint32_t key, const uint8_t *data, size_t len);
+  bool txq_has_raw_() const { return this->txq_head_ != this->txq_tail_; }
 
   bool txq_push_raw_barrier_(const uint8_t *data, size_t len);
-  bool txq_push_coalesce_(uint32_t key, const uint8_t *data, size_t len);
-  size_t txq_tombstone_same_epoch_(uint32_t key);
   bool txq_pop_(TxEntry &out);
   void txq_log_overflow_if_needed_();
   void tx_flush_();
+
+  TxMirrorEntry *txm_find_or_alloc_(uint32_t key);
+  uint32_t txm_min_dirty_epoch_() const;
+  TxMirrorEntry *txm_pick_dirty_for_epoch_(uint32_t epoch);
+  bool txm_build_command_(const TxMirrorEntry &e);
+  bool txm_set_prop_int_(const std::string &component_name, const char *prop, TxCoalesceKind kind, int value);
+  bool txm_set_vis_(const std::string &component_name, int state);
+  bool txm_set_text_(const std::string &component_name, const std::string &text);
 
   uint8_t tx_max_per_loop_{3};
   uint32_t tx_time_budget_us_{1500};
@@ -155,7 +169,7 @@ class NextionSimple : public Component {
   TxEntry txq_[TXQ_SIZE]{};
   size_t txq_head_{0};
   size_t txq_tail_{0};
-  TxDedupEntry tx_dedup_[TX_DEDUP_SIZE]{};
+  TxMirrorEntry txm_[TX_MIRROR_SIZE]{};
 
   uint32_t tx_epoch_{1};
 
@@ -171,7 +185,6 @@ class NextionSimple : public Component {
   bool tx_append_int_(int v);
 
   void tx_send_raw_barrier_();
-  void tx_send_coalesce_(uint32_t key);
 
   bool tx_append_escaped_nextion_string_(const char *s);
   bool tx_append_escaped_nextion_string_(const std::string &s);

@@ -27,17 +27,6 @@ uint32_t NextionSimple::fnv1a32_(const char *s) {
   return h;
 }
 
-uint32_t NextionSimple::fnv1a32_bytes_(const uint8_t *data, size_t len) {
-  if (data == nullptr || len == 0)
-    return 0;
-  uint32_t h = 2166136261u;
-  for (size_t i = 0; i < len; i++) {
-    h ^= data[i];
-    h *= 16777619u;
-  }
-  return h;
-}
-
 uint32_t NextionSimple::make_coalesce_key_(uint32_t comp_hash, TxCoalesceKind kind) {
   return ((comp_hash ^ (comp_hash >> 16) ^ (comp_hash >> 8)) << 8) | static_cast<uint32_t>(kind);
 }
@@ -302,7 +291,6 @@ void NextionSimple::start_init_handshake_() {
   this->rx_enabled_ = true;
   this->handshake_done_ = false;
   this->saw_expected_reply_ = false;
-  this->txq_dedup_clear_();
   this->reset_rx_state_();
   this->init_deadline_ms_ = millis() + 3000;
 
@@ -320,7 +308,6 @@ void NextionSimple::enter_writeonly_mode_() {
   }
 
   this->rx_enabled_ = false;
-  this->txq_dedup_clear_();
   this->reset_rx_state_();
   this->mode_ = NxMode::RUN_WRITEONLY;
 
@@ -371,7 +358,7 @@ void NextionSimple::diagnostic_tick_() {
   }
 }
 
-// ================= TX queue (barrier + move-to-back coalesce) =================
+// ================= TX queue (raw barriers + mirrored coalesced state) =================
 
 void NextionSimple::txq_prune_tombstones_() {
   while (this->txq_tail_ != this->txq_head_ && this->txq_[this->txq_tail_].len == 0) {
@@ -379,139 +366,12 @@ void NextionSimple::txq_prune_tombstones_() {
   }
 }
 
-void NextionSimple::txq_dedup_clear_() { memset(this->tx_dedup_, 0, sizeof(this->tx_dedup_)); }
-
-bool NextionSimple::txq_should_skip_unchanged_(uint32_t key, const uint8_t *data, size_t len) {
-  if (key == 0 || data == nullptr || len == 0)
-    return false;
-
-  const uint32_t payload_hash = fnv1a32_bytes_(data, len);
-  size_t idx = key & (TX_DEDUP_SIZE - 1);
-  for (size_t i = 0; i < TX_DEDUP_SIZE; i++) {
-    const auto &entry = this->tx_dedup_[idx];
-    if (entry.key == 0)
-      return false;
-    if (entry.key == key) {
-      return entry.payload_hash == payload_hash && entry.payload_len == len;
-    }
-    idx = (idx + 1) & (TX_DEDUP_SIZE - 1);
-  }
-
-  return false;
-}
-
-void NextionSimple::txq_dedup_store_(uint32_t key, const uint8_t *data, size_t len) {
-  if (key == 0 || data == nullptr || len == 0)
-    return;
-
-  const uint32_t payload_hash = fnv1a32_bytes_(data, len);
-  size_t idx = key & (TX_DEDUP_SIZE - 1);
-  for (size_t i = 0; i < TX_DEDUP_SIZE; i++) {
-    auto &entry = this->tx_dedup_[idx];
-    if (entry.key == 0 || entry.key == key) {
-      entry.key = key;
-      entry.payload_hash = payload_hash;
-      entry.payload_len = static_cast<uint16_t>(len);
-      return;
-    }
-    idx = (idx + 1) & (TX_DEDUP_SIZE - 1);
-  }
-
-  auto &entry = this->tx_dedup_[key & (TX_DEDUP_SIZE - 1)];
-  entry.key = key;
-  entry.payload_hash = payload_hash;
-  entry.payload_len = static_cast<uint16_t>(len);
-}
-
 bool NextionSimple::txq_push_raw_barrier_(const uint8_t *data, size_t len) {
   if (data == nullptr || len == 0)
     return false;
 
-  // Raw command acts as barrier: new epoch
+  // Raw command is an ordering barrier between mirrored epochs.
   this->tx_epoch_++;
-  this->txq_dedup_clear_();
-
-  this->txq_prune_tombstones_();
-
-  size_t nh = (this->txq_head_ + 1) & (TXQ_SIZE - 1);
-  if (nh == this->txq_tail_) {
-    // Drop oldest
-    this->txq_tail_ = (this->txq_tail_ + 1) & (TXQ_SIZE - 1);
-    this->txq_prune_tombstones_();
-    this->txq_drop_count_++;
-    this->txq_overflow_ = true;
-
-    nh = (this->txq_head_ + 1) & (TXQ_SIZE - 1);
-    if (nh == this->txq_tail_)
-      return false;
-  }
-
-  auto &slot = this->txq_[this->txq_head_];
-  if (len > sizeof(slot.data))
-    len = sizeof(slot.data);
-  memcpy(slot.data, data, len);
-
-  slot.len = static_cast<uint16_t>(len);
-  slot.key = 0;
-  slot.coalesce = 0;
-  slot.epoch = this->tx_epoch_;
-
-  this->txq_head_ = nh;
-  return true;
-}
-
-size_t NextionSimple::txq_tombstone_same_epoch_(uint32_t key) {
-  if (key == 0)
-    return 0;
-
-  size_t removed = 0;
-  size_t i = this->txq_tail_;
-  while (i != this->txq_head_) {
-    auto &slot = this->txq_[i];
-    if (slot.len != 0 && slot.coalesce == 1 && slot.key == key && slot.epoch == this->tx_epoch_) {
-      slot.len = 0;
-      removed++;
-    }
-
-    i = (i + 1) & (TXQ_SIZE - 1);
-  }
-
-  if (removed != 0) {
-    this->txq_prune_tombstones_();
-  }
-
-  return removed;
-}
-
-bool NextionSimple::txq_push_coalesce_(uint32_t key, const uint8_t *data, size_t len) {
-  if (data == nullptr || len == 0)
-    return false;
-
-  if (key != 0) {
-    bool pending_same = false;
-    bool pending_diff = false;
-    size_t i = this->txq_tail_;
-    while (i != this->txq_head_) {
-      const auto &slot = this->txq_[i];
-      if (slot.len != 0 && slot.coalesce == 1 && slot.key == key && slot.epoch == this->tx_epoch_) {
-        if (slot.len == len && memcmp(slot.data, data, len) == 0) {
-          pending_same = true;
-        } else {
-          pending_diff = true;
-        }
-      }
-      i = (i + 1) & (TXQ_SIZE - 1);
-    }
-
-    if (pending_same && !pending_diff) {
-      return true;
-    }
-    if (!pending_same && !pending_diff && this->txq_should_skip_unchanged_(key, data, len)) {
-      return true;
-    }
-
-    (void) this->txq_tombstone_same_epoch_(key);
-  }
 
   this->txq_prune_tombstones_();
 
@@ -533,8 +393,6 @@ bool NextionSimple::txq_push_coalesce_(uint32_t key, const uint8_t *data, size_t
   memcpy(slot.data, data, len);
 
   slot.len = static_cast<uint16_t>(len);
-  slot.key = key;
-  slot.coalesce = (key != 0) ? 1 : 0;
   slot.epoch = this->tx_epoch_;
 
   this->txq_head_ = nh;
@@ -568,11 +426,171 @@ void NextionSimple::txq_log_overflow_if_needed_() {
   this->txq_overflow_ = false;
 }
 
+NextionSimple::TxMirrorEntry *NextionSimple::txm_find_or_alloc_(uint32_t key) {
+  if (key == 0)
+    return nullptr;
+
+  size_t idx = key & (TX_MIRROR_SIZE - 1);
+  size_t first_free = TX_MIRROR_SIZE;
+
+  for (size_t i = 0; i < TX_MIRROR_SIZE; i++) {
+    auto &e = this->txm_[idx];
+    if (e.used && e.key == key)
+      return &e;
+    if (!e.used && first_free == TX_MIRROR_SIZE)
+      first_free = idx;
+    idx = (idx + 1) & (TX_MIRROR_SIZE - 1);
+  }
+
+  if (first_free != TX_MIRROR_SIZE) {
+    auto &e = this->txm_[first_free];
+    e = TxMirrorEntry{};
+    e.used = true;
+    e.key = key;
+    e.epoch = this->tx_epoch_;
+    return &e;
+  }
+
+  auto &e = this->txm_[key & (TX_MIRROR_SIZE - 1)];
+  e = TxMirrorEntry{};
+  e.used = true;
+  e.key = key;
+  e.epoch = this->tx_epoch_;
+  return &e;
+}
+
+uint32_t NextionSimple::txm_min_dirty_epoch_() const {
+  uint32_t min_epoch = UINT32_MAX;
+  for (const auto &e : this->txm_) {
+    if (e.used && e.dirty && e.epoch < min_epoch) {
+      min_epoch = e.epoch;
+    }
+  }
+  return min_epoch;
+}
+
+NextionSimple::TxMirrorEntry *NextionSimple::txm_pick_dirty_for_epoch_(uint32_t epoch) {
+  for (auto &e : this->txm_) {
+    if (e.used && e.dirty && e.epoch == epoch)
+      return &e;
+  }
+  return nullptr;
+}
+
+bool NextionSimple::txm_build_command_(const TxMirrorEntry &e) {
+  this->tx_begin_();
+  bool ok = true;
+
+  switch (e.kind) {
+    case TxMirrorKind::PROP_INT:
+      ok &= this->tx_append_str_(e.component);
+      ok &= this->tx_append_char_('.');
+      ok &= this->tx_append_str_(e.prop);
+      ok &= this->tx_append_char_('=');
+      ok &= this->tx_append_int_(e.int_value);
+      break;
+
+    case TxMirrorKind::VIS:
+      ok &= this->tx_append_cstr_("vis ");
+      ok &= this->tx_append_str_(e.component);
+      ok &= this->tx_append_char_(',');
+      ok &= this->tx_append_int_(e.int_value);
+      break;
+
+    case TxMirrorKind::TXT:
+      ok &= this->tx_append_str_(e.component);
+      ok &= this->tx_append_cstr_(".txt=\"");
+      ok &= this->tx_append_escaped_nextion_string_(e.text);
+      ok &= this->tx_append_char_('"');
+      break;
+
+    default:
+      return false;
+  }
+
+  return ok;
+}
+
+bool NextionSimple::txm_set_prop_int_(const std::string &component_name, const char *prop, TxCoalesceKind kind, int value) {
+  const uint32_t key = make_coalesce_key_(fnv1a32_(component_name.c_str()), kind);
+  auto *e = this->txm_find_or_alloc_(key);
+  if (e == nullptr)
+    return false;
+
+  const bool data_changed = e->kind != TxMirrorKind::PROP_INT || e->component != component_name || e->prop != prop ||
+                            e->int_value != value;
+  const bool epoch_changed = e->epoch != this->tx_epoch_;
+
+  if (data_changed) {
+    e->kind = TxMirrorKind::PROP_INT;
+    e->component = component_name;
+    e->prop = prop;
+    e->int_value = value;
+  }
+
+  e->epoch = this->tx_epoch_;
+  if (data_changed || epoch_changed) {
+    e->dirty = true;
+  }
+
+  return true;
+}
+
+bool NextionSimple::txm_set_vis_(const std::string &component_name, int state) {
+  const uint32_t key = make_coalesce_key_(fnv1a32_(component_name.c_str()), TxCoalesceKind::VIS);
+  auto *e = this->txm_find_or_alloc_(key);
+  if (e == nullptr)
+    return false;
+
+  const bool data_changed = e->kind != TxMirrorKind::VIS || e->component != component_name || e->int_value != state;
+  const bool epoch_changed = e->epoch != this->tx_epoch_;
+
+  if (data_changed) {
+    e->kind = TxMirrorKind::VIS;
+    e->component = component_name;
+    e->prop.clear();
+    e->text.clear();
+    e->int_value = state;
+  }
+
+  e->epoch = this->tx_epoch_;
+  if (data_changed || epoch_changed) {
+    e->dirty = true;
+  }
+
+  return true;
+}
+
+bool NextionSimple::txm_set_text_(const std::string &component_name, const std::string &text) {
+  const uint32_t key = make_coalesce_key_(fnv1a32_(component_name.c_str()), TxCoalesceKind::TXT);
+  auto *e = this->txm_find_or_alloc_(key);
+  if (e == nullptr)
+    return false;
+
+  const bool data_changed = e->kind != TxMirrorKind::TXT || e->component != component_name || e->text != text;
+  const bool epoch_changed = e->epoch != this->tx_epoch_;
+
+  if (data_changed) {
+    e->kind = TxMirrorKind::TXT;
+    e->component = component_name;
+    e->prop.clear();
+    e->text = text;
+  }
+
+  e->epoch = this->tx_epoch_;
+  if (data_changed || epoch_changed) {
+    e->dirty = true;
+  }
+
+  return true;
+}
+
 void NextionSimple::tx_flush_() {
   if (this->uart_parent_ == nullptr)
     return;
 
-  if (this->txq_head_ == this->txq_tail_) {
+  const uint32_t first_dirty_epoch = this->txm_min_dirty_epoch_();
+  if (!this->txq_has_raw_() && first_dirty_epoch == UINT32_MAX) {
     this->txq_log_overflow_if_needed_();
     return;
   }
@@ -580,7 +598,6 @@ void NextionSimple::tx_flush_() {
   const uint32_t deadline_us = micros() + this->tx_time_budget_us_;
   uint8_t sent = 0;
 
-  // Batch multiple queued commands into fewer UART writes to reduce driver overhead.
   uint8_t batch[384];
   size_t batch_len = 0;
   auto flush_batch = [&]() {
@@ -590,39 +607,74 @@ void NextionSimple::tx_flush_() {
     batch_len = 0;
   };
 
-  TxEntry e{};
+  auto enqueue_bytes = [&](const uint8_t *data, size_t len) {
+    if (data == nullptr || len == 0)
+      return;
+    if (len > sizeof(batch)) {
+      flush_batch();
+      this->uart_parent_->write_array(data, len);
+      return;
+    }
+    if (batch_len + len > sizeof(batch)) {
+      flush_batch();
+    }
+    memcpy(batch + batch_len, data, len);
+    batch_len += len;
+  };
+
+  TxEntry raw{};
   while (sent < this->tx_max_per_loop_) {
     if (static_cast<int32_t>(micros() - deadline_us) >= 0)
       break;
 
-    if (!this->txq_pop_(e))
+    this->txq_prune_tombstones_();
+    const uint32_t min_dirty_epoch = this->txm_min_dirty_epoch_();
+    const bool has_dirty = (min_dirty_epoch != UINT32_MAX);
+    const bool has_raw = this->txq_has_raw_();
+
+    if (!has_dirty && !has_raw)
       break;
 
-    const size_t e_len = e.len;
-    if (e_len > sizeof(batch)) {
-      flush_batch();
-      this->uart_parent_->write_array(e.data, e_len);
-      if (e.coalesce == 1 && e.key != 0) {
-        this->txq_dedup_store_(e.key, e.data, e_len);
+    bool send_dirty = false;
+    if (has_dirty) {
+      if (!has_raw) {
+        send_dirty = true;
+      } else {
+        const auto &head_raw = this->txq_[this->txq_tail_];
+        if (min_dirty_epoch < head_raw.epoch) {
+          send_dirty = true;
+        }
       }
+    }
+
+    if (send_dirty) {
+      auto *m = this->txm_pick_dirty_for_epoch_(min_dirty_epoch);
+      if (m == nullptr)
+        continue;
+
+      if (!this->txm_build_command_(*m)) {
+        m->dirty = false;
+        continue;
+      }
+
+      this->tx_buf_[this->tx_len_] = 0xFF;
+      this->tx_buf_[this->tx_len_ + 1] = 0xFF;
+      this->tx_buf_[this->tx_len_ + 2] = 0xFF;
+      enqueue_bytes(this->tx_buf_, this->tx_len_ + 3);
+
+      m->dirty = false;
       sent++;
       continue;
     }
 
-    if (batch_len + e_len > sizeof(batch)) {
-      flush_batch();
-    }
+    if (!this->txq_pop_(raw))
+      continue;
 
-    memcpy(batch + batch_len, e.data, e_len);
-    batch_len += e_len;
-    if (e.coalesce == 1 && e.key != 0) {
-      this->txq_dedup_store_(e.key, e.data, e_len);
-    }
+    enqueue_bytes(raw.data, raw.len);
     sent++;
   }
 
   flush_batch();
-
   this->txq_log_overflow_if_needed_();
 }
 
@@ -695,18 +747,6 @@ void NextionSimple::tx_send_raw_barrier_() {
   (void) this->txq_push_raw_barrier_(this->tx_buf_, n);
 }
 
-void NextionSimple::tx_send_coalesce_(uint32_t key) {
-  if (this->uart_parent_ == nullptr)
-    return;
-
-  this->tx_buf_[this->tx_len_] = 0xFF;
-  this->tx_buf_[this->tx_len_ + 1] = 0xFF;
-  this->tx_buf_[this->tx_len_ + 2] = 0xFF;
-
-  const size_t n = this->tx_len_ + 3;
-  (void) this->txq_push_coalesce_(key, this->tx_buf_, n);
-}
-
 bool NextionSimple::tx_append_escaped_nextion_string_(const char *s) {
   if (s == nullptr)
     return false;
@@ -744,59 +784,21 @@ bool NextionSimple::tx_append_escaped_nextion_string_(const std::string &s) {
 void NextionSimple::send_prop_int_(const std::string &component_name, const char *prop, TxCoalesceKind kind, int value) {
   if (this->uart_parent_ == nullptr)
     return;
-
-  this->tx_begin_();
-
-  bool ok = true;
-  ok &= this->tx_append_str_(component_name);
-  ok &= this->tx_append_char_('.');
-  ok &= this->tx_append_cstr_(prop);
-  ok &= this->tx_append_char_('=');
-  ok &= this->tx_append_int_(value);
-
-  if (!ok)
-    return;
-
-  const uint32_t key = make_coalesce_key_(fnv1a32_(component_name.c_str()), kind);
-  this->tx_send_coalesce_(key);
+  (void) this->txm_set_prop_int_(component_name, prop, kind, value);
 }
 
 void NextionSimple::send_vis_(const std::string &component_name, int state) {
   if (this->uart_parent_ == nullptr)
     return;
-
-  this->tx_begin_();
-
-  bool ok = true;
-  ok &= this->tx_append_cstr_("vis ");
-  ok &= this->tx_append_str_(component_name);
-  ok &= this->tx_append_char_(',');
-  ok &= this->tx_append_int_(state);
-
-  if (!ok)
-    return;
-
-  const uint32_t key = make_coalesce_key_(fnv1a32_(component_name.c_str()), TxCoalesceKind::VIS);
-  this->tx_send_coalesce_(key);
+  (void) this->txm_set_vis_(component_name, state);
 }
 
 void NextionSimple::send_set_text_(const std::string &component_name, const char *text) {
   if (this->uart_parent_ == nullptr)
     return;
-
-  this->tx_begin_();
-
-  bool ok = true;
-  ok &= this->tx_append_str_(component_name);
-  ok &= this->tx_append_cstr_(".txt=\"");
-  ok &= this->tx_append_escaped_nextion_string_(text);
-  ok &= this->tx_append_char_('"');
-
-  if (!ok)
+  if (text == nullptr)
     return;
-
-  const uint32_t key = make_coalesce_key_(fnv1a32_(component_name.c_str()), TxCoalesceKind::TXT);
-  this->tx_send_coalesce_(key);
+  (void) this->txm_set_text_(component_name, text);
 }
 
 void NextionSimple::send_set_text_formatted_(const std::string &component_name, const std::string &fmt,
@@ -804,57 +806,22 @@ void NextionSimple::send_set_text_formatted_(const std::string &component_name, 
   if (this->uart_parent_ == nullptr)
     return;
 
-  this->tx_begin_();
-
-  bool ok = true;
-  ok &= this->tx_append_str_(component_name);
-  ok &= this->tx_append_cstr_(".txt=\"");
-
+  std::string text;
+  text.reserve(fmt.size() + args.size() * 8);
   size_t arg_i = 0;
   const char *p = fmt.c_str();
 
   while (*p) {
-    if (p[0] == '%' && p[1] == 's') {
-      if (arg_i < args.size()) {
-        ok &= this->tx_append_escaped_nextion_string_(args[arg_i++]);
-        p += 2;
-        if (!ok)
-          break;
-        continue;
-      }
+    if (p[0] == '%' && p[1] == 's' && arg_i < args.size()) {
+      text += args[arg_i++];
+      p += 2;
+      continue;
     }
 
-    const char c = *p++;
-    switch (c) {
-      case '\\':
-        ok &= this->tx_append_char_('\\');
-        ok &= this->tx_append_char_('\\');
-        break;
-      case '"':
-        ok &= this->tx_append_char_('\\');
-        ok &= this->tx_append_char_('"');
-        break;
-      case '\r':
-      case '\n':
-      case '\t':
-        ok &= this->tx_append_char_(' ');
-        break;
-      default:
-        ok &= this->tx_append_char_(c);
-        break;
-    }
-
-    if (!ok)
-      break;
+    text.push_back(*p++);
   }
 
-  ok &= this->tx_append_char_('"');
-
-  if (!ok)
-    return;
-
-  const uint32_t key = make_coalesce_key_(fnv1a32_(component_name.c_str()), TxCoalesceKind::TXT);
-  this->tx_send_coalesce_(key);
+  (void) this->txm_set_text_(component_name, text);
 }
 
 // ================= High-level API =================
