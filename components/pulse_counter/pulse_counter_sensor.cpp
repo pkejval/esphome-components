@@ -320,11 +320,31 @@ PulseCounterSensor::~PulseCounterSensor() {
 void PulseCounterSensor::set_min_pulses_per_calc(uint32_t n) {
   this->min_pulses_for_calc_ = (n == 0 ? 1u : n);
   this->custom_tuning_ = true;
+  this->fixed_time_window_ = false;
 }
 
 void PulseCounterSensor::set_max_accumulation_ms(uint32_t ms) {
   this->max_accumulation_us_ = static_cast<uint64_t>(ms) * 1000ULL;
   this->custom_tuning_ = true;
+  this->fixed_time_window_ = false;
+}
+
+void PulseCounterSensor::apply_default_tuning_() {
+  const uint64_t ui_us = static_cast<uint64_t>(this->get_update_interval()) * 1000ULL;
+
+#if defined(USE_ESP32)
+  if (this->hw_pcnt_) {
+    // For ESP32 HW PCNT, keep a fixed time window to minimize output jitter.
+    this->fixed_time_window_ = true;
+    this->min_pulses_for_calc_ = 1;
+    this->max_accumulation_us_ = std::max<uint64_t>(ui_us, 20000ULL);
+    return;
+  }
+#endif
+
+  this->fixed_time_window_ = false;
+  this->min_pulses_for_calc_ = 3;
+  this->max_accumulation_us_ = std::max<uint64_t>(ui_us * 2ULL, 20000ULL);
 }
 
 void PulseCounterSensor::reset_accumulation_() {
@@ -339,8 +359,7 @@ void PulseCounterSensor::setup() {
   }
 
   if (!this->custom_tuning_) {
-    const uint64_t ui_us = static_cast<uint64_t>(this->get_update_interval()) * 1000ULL;
-    this->max_accumulation_us_ = std::max<uint64_t>(ui_us * 2ULL, 20000ULL);
+    this->apply_default_tuning_();
   }
 
 #if defined(USE_ESP32)
@@ -368,7 +387,7 @@ void PulseCounterSensor::setup() {
     return;
   }
 
-  this->last_tick_us_ = 0;
+  this->last_tick_us_ = static_cast<uint64_t>(esp_timer_get_time());
   this->reset_accumulation_();
 #endif
 
@@ -385,8 +404,7 @@ void PulseCounterSensor::set_update_interval(uint32_t update_interval) {
   PollingComponent::set_update_interval(update_interval);
 
   if (!this->custom_tuning_) {
-    const uint64_t ui_us = static_cast<uint64_t>(this->get_update_interval()) * 1000ULL;
-    this->max_accumulation_us_ = std::max<uint64_t>(ui_us * 2ULL, 20000ULL);
+    this->apply_default_tuning_();
   }
 
 #if defined(USE_ESP32)
@@ -404,7 +422,7 @@ void PulseCounterSensor::set_update_interval(uint32_t update_interval) {
       return;
     }
 
-    this->last_tick_us_ = 0;
+    this->last_tick_us_ = static_cast<uint64_t>(esp_timer_get_time());
     this->reset_accumulation_();
   }
 #endif
@@ -426,10 +444,12 @@ void PulseCounterSensor::dump_config() {
                 "  Falling Edge: %s\n"
                 "  Filtering pulses shorter than %" PRIu32 " us\n"
                 "  Min pulses per calc: %" PRIu32 "\n"
-                "  Max accumulation (ms): %" PRIu64,
+                "  Max accumulation (ms): %" PRIu64 "\n"
+                "  Fixed time window: %s",
                 EDGE_MODE_TO_STRING[this->storage_->rising_edge_mode],
                 EDGE_MODE_TO_STRING[this->storage_->falling_edge_mode], this->storage_->filter_us,
-                this->min_pulses_for_calc_, this->max_accumulation_us_ / 1000ULL);
+                this->min_pulses_for_calc_, this->max_accumulation_us_ / 1000ULL,
+                this->fixed_time_window_ ? "yes" : "no");
   LOG_UPDATE_INTERVAL(this);
 }
 
@@ -456,11 +476,22 @@ void PulseCounterSensor::timer_callback(void *arg) {
   if (dt_us == 0)
     return;
 
+  if (self->fixed_time_window_) {
+    const double ppm = (static_cast<double>(delta) * 60000000.0) / static_cast<double>(dt_us);
+    if (std::isfinite(ppm) && std::fabs(ppm) < 1e9) {
+      self->last_calculated_ppm_.store(static_cast<float>(ppm), std::memory_order_relaxed);
+      self->new_value_ready_.store(true, std::memory_order_release);
+    }
+    return;
+  }
+
   self->accum_dt_us_ += dt_us;
   if (delta != 0)
     self->accum_pulses_ += static_cast<int64_t>(delta);
 
-  const bool enough_pulses = (std::llabs(self->accum_pulses_) >= static_cast<int64_t>(self->min_pulses_for_calc_));
+  const bool enough_pulses =
+      !self->fixed_time_window_ &&
+      (std::llabs(self->accum_pulses_) >= static_cast<int64_t>(self->min_pulses_for_calc_));
   const bool time_up = (self->accum_dt_us_ >= self->max_accumulation_us_);
 
   if (enough_pulses || time_up) {
@@ -477,8 +508,14 @@ void PulseCounterSensor::timer_callback(void *arg) {
 }
 #endif
 
-void PulseCounterSensor::update() {
+void PulseCounterSensor::loop() {
 #if defined(USE_ESP32)
+  this->process_pending_();
+#endif
+}
+
+#if defined(USE_ESP32)
+void PulseCounterSensor::process_pending_() {
   if (this->new_value_ready_.load(std::memory_order_acquire)) {
     this->new_value_ready_.store(false, std::memory_order_release);
     const float ppm = this->last_calculated_ppm_.load(std::memory_order_relaxed);
@@ -504,6 +541,14 @@ void PulseCounterSensor::update() {
       this->total_ever_published_ = true;
     }
   }
+}
+#endif
+
+void PulseCounterSensor::update() {
+#if defined(USE_ESP32)
+  // ESP32 path publishes from loop() to minimize publish latency to new timer samples.
+  // Keep update() as no-op because PollingComponent requires it.
+  return;
 #else
   const uint64_t t = static_cast<uint64_t>(micros());
   const pulse_counter_t delta = this->storage_->read_delta();

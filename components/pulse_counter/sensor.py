@@ -21,6 +21,8 @@ from esphome.const import (
 from esphome.core import CORE
 
 CONF_USE_PCNT = "use_pcnt"
+CONF_MIN_PULSES_PER_CALC = "min_pulses_per_calc"
+CONF_MAX_ACCUMULATION = "max_accumulation"
 
 LEGACY_ESP32_PCNT_FILTER_LIMIT_US = 12.0   # ESP32 a ESP32-S2
 MODERN_ESP32_PCNT_FILTER_LIMIT_US = 819.0  # ESP32-S3, C3, C6, H2
@@ -115,6 +117,8 @@ CONFIG_SCHEMA = cv.All(
             ),
             cv.SplitDefault(CONF_USE_PCNT, esp32=True): cv.boolean,
             cv.Optional(CONF_INTERNAL_FILTER, default="12us"): cv.positive_time_period_microseconds,
+            cv.Optional(CONF_MIN_PULSES_PER_CALC): cv.int_range(min=1, max=4294967295),
+            cv.Optional(CONF_MAX_ACCUMULATION): cv.positive_time_period_milliseconds,
             cv.Optional(CONF_TOTAL): sensor.sensor_schema(
                 unit_of_measurement=UNIT_PULSES,
                 icon=ICON_PULSE,
@@ -144,6 +148,11 @@ async def to_code(config):
         cg.add(var.set_filter_us(int(clamped_us)))
     else:
         cg.add(var.set_filter_us(config[CONF_INTERNAL_FILTER].total_microseconds))
+
+    if CONF_MIN_PULSES_PER_CALC in config:
+        cg.add(var.set_min_pulses_per_calc(config[CONF_MIN_PULSES_PER_CALC]))
+    if CONF_MAX_ACCUMULATION in config:
+        cg.add(var.set_max_accumulation_ms(int(config[CONF_MAX_ACCUMULATION].total_milliseconds)))
 
     if CONF_TOTAL in config:
         sens = await sensor.new_sensor(config[CONF_TOTAL])

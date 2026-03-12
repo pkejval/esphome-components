@@ -156,7 +156,7 @@ std::unique_ptr<PulseCounterStorageBase> get_storage(bool hw_pcnt = false);
 
 class PulseCounterSensor : public sensor::Sensor, public PollingComponent {
  public:
-  explicit PulseCounterSensor(bool hw_pcnt = false) : storage_(get_storage(hw_pcnt)) {}
+  explicit PulseCounterSensor(bool hw_pcnt = false) : storage_(get_storage(hw_pcnt)), hw_pcnt_(hw_pcnt) {}
   ~PulseCounterSensor();
 
   void set_pin(InternalGPIOPin *pin) { pin_ = pin; }
@@ -171,6 +171,7 @@ class PulseCounterSensor : public sensor::Sensor, public PollingComponent {
   void set_total_pulses(uint32_t pulses);
 
   void setup() override;
+  void loop() override;
   void update() override;
   void dump_config() override;
   void set_update_interval(uint32_t update_interval) override;
@@ -178,8 +179,10 @@ class PulseCounterSensor : public sensor::Sensor, public PollingComponent {
  protected:
 #if defined(USE_ESP32)
   static void timer_callback(void *arg);
+  void process_pending_();
 #endif
 
+  void apply_default_tuning_();
   void reset_accumulation_();
 
   InternalGPIOPin *pin_{nullptr};
@@ -195,6 +198,8 @@ class PulseCounterSensor : public sensor::Sensor, public PollingComponent {
   uint32_t min_pulses_for_calc_{3};
   uint64_t max_accumulation_us_{0};
   bool custom_tuning_{false};
+  bool hw_pcnt_{false};
+  bool fixed_time_window_{false};
 
 #if defined(USE_ESP32)
   esp_timer_handle_t timer_handle_{nullptr};

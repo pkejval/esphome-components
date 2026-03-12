@@ -71,6 +71,7 @@ class PulseMeterSensor : public sensor::Sensor, public Component {
  protected:
   static void IRAM_ATTR edge_intr(PulseMeterSensor *sensor);
   static void IRAM_ATTR pulse_intr(PulseMeterSensor *sensor);
+  static void IRAM_ATTR pulse_intr_sample_(PulseMeterSensor *sensor, uint32_t now, bool pin_val);
 
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
   static bool IRAM_ATTR rmt_rx_done_cb_(rmt_channel_handle_t channel, const rmt_rx_done_event_data_t *edata,
@@ -212,6 +213,7 @@ class PulseMeterSensor : public sensor::Sensor, public Component {
   volatile bool rmt_pending_{false};
   volatile const rmt_symbol_word_t *rmt_recv_symbols_{nullptr};
   volatile size_t rmt_recv_count_{0};
+  volatile uint32_t rmt_done_us_{0};
 #endif
 };
 

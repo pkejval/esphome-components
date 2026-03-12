@@ -92,6 +92,7 @@ void PulseMeterSensor::setup() {
     this->rmt_pending_ = false;
     this->rmt_recv_symbols_ = nullptr;
     this->rmt_recv_count_ = 0;
+    this->rmt_done_us_ = 0;
 
     rmt_rx_channel_config_t ch_cfg{};
     ch_cfg.gpio_num = (gpio_num_t) this->pin_->get_pin();
@@ -124,6 +125,7 @@ void PulseMeterSensor::setup() {
       this->rmt_pending_ = false;
       this->rmt_recv_symbols_ = nullptr;
       this->rmt_recv_count_ = 0;
+      this->rmt_done_us_ = 0;
     }
   }
 #endif
@@ -149,17 +151,46 @@ void PulseMeterSensor::setup() {
 
 void PulseMeterSensor::loop() {
   const uint32_t now = micros();
+  bool do_poll = false;
+  bool poll_sampled = false;
+  bool poll_current = false;
+  uint32_t poll_sample_us = now;
+
+#if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
+  bool use_rmt = this->use_rmt_;
+#endif
+
+#if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
+  if (!use_rmt) {
+    do_poll = this->should_poll_fallback_(now);
+  }
+#else
+  do_poll = this->should_poll_fallback_(now);
+#endif
+
+  if (do_poll) {
+    poll_current = this->isr_pin_.digital_read();
+    poll_sampled = true;
+    if (poll_current != this->last_polled_pin_val_) {
+      poll_sample_us = micros();
+    }
+  }
 
   if (LIKELY(!this->new_event_) && LIKELY(time_before_(now, this->next_timeout_check_us_))) {
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
-    if (this->use_rmt_) {
+    if (use_rmt) {
       if (!this->rmt_pending_ && this->rmt_recv_count_ == 0) {
         return;
       }
     } else
 #endif
     {
-      if (!this->should_poll_fallback_(now)) {
+      if (!do_poll) {
+        return;
+      }
+      if (poll_sampled && poll_current == this->last_polled_pin_val_) {
+        this->last_polled_pin_val_ = poll_current;
+        this->schedule_next_poll_(now);
         return;
       }
     }
@@ -173,8 +204,8 @@ void PulseMeterSensor::loop() {
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
   const rmt_symbol_word_t *local_syms = nullptr;
   size_t local_sym_count = 0;
+  uint32_t local_rmt_done_us = 0;
   bool local_rmt_consumed = false;
-  bool use_rmt = this->use_rmt_;
 #endif
 
   {
@@ -185,9 +216,11 @@ void PulseMeterSensor::loop() {
       if (this->rmt_pending_ || this->rmt_recv_count_ != 0 || this->rmt_recv_symbols_ != nullptr) {
         local_syms = (const rmt_symbol_word_t *) this->rmt_recv_symbols_;
         local_sym_count = (size_t) this->rmt_recv_count_;
+        local_rmt_done_us = this->rmt_done_us_;
         this->rmt_pending_ = false;
         this->rmt_recv_symbols_ = nullptr;
         this->rmt_recv_count_ = 0;
+        this->rmt_done_us_ = 0;
         local_rmt_consumed = true;
       }
     }
@@ -197,8 +230,8 @@ void PulseMeterSensor::loop() {
     if (!use_rmt)
 #endif
     {
-      if (this->should_poll_fallback_(now)) {
-        bool current = this->isr_pin_.digital_read();
+      if (do_poll) {
+        const bool current = this->isr_pin_.digital_read();
 
         if (this->filter_mode_ == FILTER_EDGE) {
           if (current && !this->last_polled_pin_val_) {
@@ -206,7 +239,7 @@ void PulseMeterSensor::loop() {
           }
         } else {
           if (current != this->last_polled_pin_val_) {
-            PulseMeterSensor::pulse_intr(this);
+            PulseMeterSensor::pulse_intr_sample_(this, micros(), current);
           }
         }
 
@@ -237,14 +270,19 @@ void PulseMeterSensor::loop() {
       bool last_pin = this->pulse_state_.last_pin_val_;
       uint32_t last_edge_us = tdet;
       uint32_t last_rise_us = trise;
+      uint32_t elapsed_us = 0;
+      uint32_t last_edge_offset_us = 0;
 
       uint32_t add_cnt = 0;
+
+      const uint32_t frame_done_us = (local_rmt_done_us != 0) ? local_rmt_done_us : now;
 
       for (size_t i = 0; i < local_sym_count; ++i) {
         const auto &w = local_syms[i];
 
         const bool lvl0 = w.level0;
         const uint32_t dur0_us = w.duration0;
+        elapsed_us += dur0_us;
         if (lvl0 != last_pin) {
           if (!last_pin) {
             if (dur0_us >= this->min_low_us_) {
@@ -253,8 +291,7 @@ void PulseMeterSensor::loop() {
           } else {
             if (dur0_us >= this->min_high_us_) {
               latched = true;
-              last_edge_us = now;
-              last_rise_us = now;
+              last_edge_offset_us = elapsed_us;
               add_cnt++;
             }
           }
@@ -263,6 +300,7 @@ void PulseMeterSensor::loop() {
 
         const bool lvl1 = w.level1;
         const uint32_t dur1_us = w.duration1;
+        elapsed_us += dur1_us;
         if (lvl1 != last_pin) {
           if (!last_pin) {
             if (dur1_us >= this->min_low_us_) {
@@ -271,8 +309,7 @@ void PulseMeterSensor::loop() {
           } else {
             if (dur1_us >= this->min_high_us_) {
               latched = true;
-              last_edge_us = now;
-              last_rise_us = now;
+              last_edge_offset_us = elapsed_us;
               add_cnt++;
             }
           }
@@ -284,6 +321,9 @@ void PulseMeterSensor::loop() {
       this->pulse_state_.last_pin_val_ = last_pin;
 
       if (add_cnt > 0) {
+        const uint32_t tail_us = elapsed_us - last_edge_offset_us;
+        last_edge_us = frame_done_us - tail_us;
+        last_rise_us = last_edge_us;
         cnt += add_cnt;
         tdet = last_edge_us;
         trise = last_rise_us;
@@ -395,9 +435,9 @@ void PulseMeterSensor::dump_config() {
 
 void IRAM_ATTR PulseMeterSensor::edge_intr(PulseMeterSensor *sensor) {
   const uint32_t now = micros();
+  const bool coalesce = sensor->coalesce_enabled_edge_ && sensor->coalesce_min_us_ > 0;
 
-  if (sensor->coalesce_enabled_edge_ && sensor->coalesce_min_us_ > 0 &&
-      time_before_(now, sensor->coalesce_until_us_)) {
+  if (coalesce && time_before_(now, sensor->coalesce_until_us_)) {
     return;
   }
 
@@ -411,7 +451,7 @@ void IRAM_ATTR PulseMeterSensor::edge_intr(PulseMeterSensor *sensor) {
     set.count_ = set.count_ + 1;
     sensor->new_event_ = true;
 
-    if (sensor->coalesce_enabled_edge_ && sensor->coalesce_min_us_ > 0) {
+    if (coalesce) {
       sensor->coalesce_until_us_ = now + sensor->coalesce_min_us_;
     }
   }
@@ -419,28 +459,37 @@ void IRAM_ATTR PulseMeterSensor::edge_intr(PulseMeterSensor *sensor) {
 
 void IRAM_ATTR PulseMeterSensor::pulse_intr(PulseMeterSensor *sensor) {
   const uint32_t now = micros();
-
   const bool pin_val = sensor->isr_pin_.digital_read();
+  PulseMeterSensor::pulse_intr_sample_(sensor, now, pin_val);
+}
+
+void IRAM_ATTR PulseMeterSensor::pulse_intr_sample_(PulseMeterSensor *sensor, uint32_t now, bool pin_val) {
   auto &st = sensor->pulse_state_;
   auto &set = *sensor->set_;
 
-  const bool long_enough = (now - st.last_intr_) >= sensor->filter_us_;
+  const uint32_t last_intr = st.last_intr_;
+  const bool prev_pin = st.last_pin_val_;
+  bool latched = st.latched_;
 
-  if (long_enough && st.latched_ && !st.last_pin_val_) {
-    if ((now - st.last_intr_) >= sensor->min_low_us_) {
-      st.latched_ = false;
+  const uint32_t dt_us = now - last_intr;
+  const bool long_enough = dt_us >= sensor->filter_us_;
+
+  if (long_enough && latched && !prev_pin) {
+    if (dt_us >= sensor->min_low_us_) {
+      latched = false;
     }
-  } else if (long_enough && !st.latched_ && st.last_pin_val_) {
-    if ((now - st.last_intr_) >= sensor->min_high_us_) {
-      st.latched_ = true;
-      set.last_detected_edge_us_ = st.last_intr_;
+  } else if (long_enough && !latched && prev_pin) {
+    if (dt_us >= sensor->min_high_us_) {
+      latched = true;
+      set.last_detected_edge_us_ = last_intr;
       set.count_ = set.count_ + 1;
       sensor->new_event_ = true;
     }
   }
 
-  set.last_rising_edge_us_ = (!st.latched_ && pin_val) ? now : set.last_detected_edge_us_;
+  set.last_rising_edge_us_ = (!latched && pin_val) ? now : set.last_detected_edge_us_;
 
+  st.latched_ = latched;
   st.last_intr_ = now;
   st.last_pin_val_ = pin_val;
 }
@@ -450,6 +499,7 @@ bool IRAM_ATTR PulseMeterSensor::rmt_rx_done_cb_(rmt_channel_handle_t, const rmt
                                                  void *user_ctx) {
   auto *self = static_cast<PulseMeterSensor *>(user_ctx);
 
+  self->rmt_done_us_ = micros();
   self->rmt_pending_ = true;
 
   if (edata == nullptr || edata->received_symbols == nullptr || edata->num_symbols == 0) {
