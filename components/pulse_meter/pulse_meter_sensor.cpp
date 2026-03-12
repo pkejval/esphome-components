@@ -49,6 +49,7 @@ void PulseMeterSensor::setup() {
 
   this->last_processed_edge_us_ = now;
   this->next_timeout_check_us_ = now + this->timeout_us_;
+  this->next_zero_publish_us_ = 0;
   this->new_event_ = false;
   this->peeked_edge_ = false;
 
@@ -154,27 +155,10 @@ void PulseMeterSensor::loop() {
   bool do_poll = false;
   bool poll_sampled = false;
   bool poll_current = false;
-  uint32_t poll_sample_us = now;
 
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
   bool use_rmt = this->use_rmt_;
 #endif
-
-#if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
-  if (!use_rmt) {
-    do_poll = this->should_poll_fallback_(now);
-  }
-#else
-  do_poll = this->should_poll_fallback_(now);
-#endif
-
-  if (do_poll) {
-    poll_current = this->isr_pin_.digital_read();
-    poll_sampled = true;
-    if (poll_current != this->last_polled_pin_val_) {
-      poll_sample_us = micros();
-    }
-  }
 
   if (LIKELY(!this->new_event_) && LIKELY(time_before_(now, this->next_timeout_check_us_))) {
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
@@ -185,9 +169,14 @@ void PulseMeterSensor::loop() {
     } else
 #endif
     {
+      do_poll = this->should_poll_fallback_(now);
       if (!do_poll) {
         return;
       }
+
+      poll_current = this->isr_pin_.digital_read();
+      poll_sampled = true;
+
       if (poll_sampled && poll_current == this->last_polled_pin_val_) {
         this->last_polled_pin_val_ = poll_current;
         this->schedule_next_poll_(now);
@@ -369,6 +358,7 @@ void PulseMeterSensor::loop() {
     }
 
     this->last_processed_edge_us_ = tdet;
+    this->next_zero_publish_us_ = 0;
     this->plan_next_check_(now);
     return;
   }
@@ -386,16 +376,36 @@ void PulseMeterSensor::loop() {
 
           this->reset_period_estimate_();
 
-          this->next_timeout_check_us_ = now + this->timeout_us_;
+          if (this->timeout_zero_publish_interval_us_ > 0) {
+            this->next_zero_publish_us_ = now + this->timeout_zero_publish_interval_us_;
+            this->next_timeout_check_us_ = this->next_zero_publish_us_;
+          } else {
+            this->next_zero_publish_us_ = 0;
+            this->next_timeout_check_us_ = now + this->timeout_us_;
+          }
         } else {
           this->plan_next_check_(now);
+        }
+        break;
+      case MeterState::TIMED_OUT:
+        if (this->timeout_zero_publish_interval_us_ > 0 && this->next_zero_publish_us_ != 0) {
+          if (time_reached_(now, this->next_zero_publish_us_)) {
+            this->publish_state(0.0f);
+            this->next_zero_publish_us_ = now + this->timeout_zero_publish_interval_us_;
+          }
+          this->next_timeout_check_us_ = this->next_zero_publish_us_;
         }
         break;
       default:
         break;
     }
   } else {
-    this->plan_next_check_(now);
+    if (this->meter_state_ == MeterState::TIMED_OUT && this->timeout_zero_publish_interval_us_ > 0 &&
+        this->next_zero_publish_us_ != 0) {
+      this->next_timeout_check_us_ = this->next_zero_publish_us_;
+    } else {
+      this->plan_next_check_(now);
+    }
   }
 }
 
@@ -415,6 +425,12 @@ void PulseMeterSensor::dump_config() {
   }
   ESP_LOGCONFIG(TAG, "  Assuming 0 pulses/min after not receiving a pulse for %" PRIu32 " s",
                 this->timeout_us_ / 1000000);
+  if (this->timeout_zero_publish_interval_us_ > 0) {
+    ESP_LOGCONFIG(TAG, "  Timeout zero re-publish interval: %" PRIu32 " ms",
+                  this->timeout_zero_publish_interval_us_ / 1000U);
+  } else {
+    ESP_LOGCONFIG(TAG, "  Timeout zero re-publish interval: disabled");
+  }
   ESP_LOGCONFIG(TAG, "  Poll fallback: %s", this->poll_fallback_enabled_ ? "enabled" : "disabled");
 
 #if defined(ESP_IDF_VERSION) && __has_include("driver/gpio_filter.h")

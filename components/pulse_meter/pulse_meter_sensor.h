@@ -52,8 +52,10 @@ class PulseMeterSensor : public sensor::Sensor, public Component {
   }
 
   void set_timeout_us(uint32_t timeout) { this->timeout_us_ = timeout; }
+  void set_timeout_zero_publish_interval_us(uint32_t interval) { this->timeout_zero_publish_interval_us_ = interval; }
   void set_total_sensor(sensor::Sensor *sensor) { this->total_sensor_ = sensor; }
   void set_filter_mode(InternalFilterMode mode) { this->filter_mode_ = mode; }
+  void set_poll_fallback_enabled(bool enabled) { this->poll_fallback_enabled_ = enabled; }
 
   void set_pulse_hysteresis_us(uint32_t min_low_us, uint32_t min_high_us) {
     this->min_low_us_ = min_low_us;
@@ -150,6 +152,7 @@ class PulseMeterSensor : public sensor::Sensor, public Component {
 
   uint32_t filter_us_{0};
   uint32_t timeout_us_{1000000UL * 60UL * 5UL};
+  uint32_t timeout_zero_publish_interval_us_{0};
   sensor::Sensor *total_sensor_{nullptr};
   InternalFilterMode filter_mode_{FILTER_EDGE};
 
@@ -186,6 +189,7 @@ class PulseMeterSensor : public sensor::Sensor, public Component {
   volatile bool new_event_{false};
 
   uint32_t next_timeout_check_us_{0};
+  uint32_t next_zero_publish_us_{0};
 
   uint32_t min_low_us_{0};
   uint32_t min_high_us_{0};

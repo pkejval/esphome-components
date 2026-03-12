@@ -23,6 +23,11 @@ CODEOWNERS = ["@stevebaxter", "@cstaahl", "@TrentHouliston"]
 
 pulse_meter_ns = cg.esphome_ns.namespace("pulse_meter")
 
+CONF_POLL_FALLBACK = "poll_fallback"
+CONF_MIN_LOW = "min_low"
+CONF_MIN_HIGH = "min_high"
+CONF_TIMEOUT_ZERO_PUBLISH_INTERVAL = "timeout_zero_publish_interval"
+
 
 PulseMeterSensor = pulse_meter_ns.class_(
     "PulseMeterSensor", sensor.Sensor, cg.Component
@@ -77,6 +82,10 @@ CONFIG_SCHEMA = sensor.sensor_schema(
         cv.Optional(CONF_INTERNAL_FILTER_MODE, default="EDGE"): cv.enum(
             FILTER_MODES, upper=True
         ),
+        cv.Optional(CONF_TIMEOUT_ZERO_PUBLISH_INTERVAL): validate_timeout,
+        cv.Optional(CONF_POLL_FALLBACK, default=True): cv.boolean,
+        cv.Optional(CONF_MIN_LOW): validate_internal_filter,
+        cv.Optional(CONF_MIN_HIGH): validate_internal_filter,
     }
 )
 
@@ -90,6 +99,23 @@ async def to_code(config):
     cg.add(var.set_filter_us(config[CONF_INTERNAL_FILTER]))
     cg.add(var.set_timeout_us(config[CONF_TIMEOUT]))
     cg.add(var.set_filter_mode(config[CONF_INTERNAL_FILTER_MODE]))
+    if CONF_TIMEOUT_ZERO_PUBLISH_INTERVAL in config:
+        cg.add(
+            var.set_timeout_zero_publish_interval_us(
+                config[CONF_TIMEOUT_ZERO_PUBLISH_INTERVAL]
+            )
+        )
+    cg.add(var.set_poll_fallback_enabled(config[CONF_POLL_FALLBACK]))
+
+    min_low = config.get(CONF_MIN_LOW)
+    min_high = config.get(CONF_MIN_HIGH)
+    if min_low is not None or min_high is not None:
+        base = config[CONF_INTERNAL_FILTER]
+        if min_low is None:
+            min_low = (base * 4) // 5
+        if min_high is None:
+            min_high = (base * 6) // 5
+        cg.add(var.set_pulse_hysteresis_us(min_low, min_high))
 
     if CONF_TOTAL in config:
         sens = await sensor.new_sensor(config[CONF_TOTAL])
