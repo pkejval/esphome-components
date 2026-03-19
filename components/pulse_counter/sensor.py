@@ -162,12 +162,13 @@ async def to_code(config):
 @automation.register_action(
     "pulse_counter.set_total_pulses",
     SetTotalPulsesAction,
-    cv.Schema(
+    schema=cv.Schema(
         {
             cv.Required(CONF_ID): cv.use_id(PulseCounterSensor),
             cv.Required(CONF_VALUE): cv.templatable(cv.uint32_t),
         }
     ),
+    synchronous=True,
 )
 async def set_total_action_to_code(config, action_id, template_arg, args):
     paren = await cg.get_variable(config[CONF_ID])
