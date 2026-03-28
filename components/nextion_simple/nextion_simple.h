@@ -156,8 +156,6 @@ class NextionSimple : public Component {
   void tx_flush_();
 
   TxMirrorEntry *txm_find_or_alloc_(uint32_t key);
-  uint32_t txm_min_dirty_epoch_() const;
-  TxMirrorEntry *txm_pick_dirty_for_epoch_(uint32_t epoch);
   bool txm_build_command_(const TxMirrorEntry &e);
   bool txm_set_prop_int_(const std::string &component_name, const char *prop, TxCoalesceKind kind, int value);
   bool txm_set_vis_(const std::string &component_name, int state);
@@ -170,6 +168,9 @@ class NextionSimple : public Component {
   size_t txq_head_{0};
   size_t txq_tail_{0};
   TxMirrorEntry txm_[TX_MIRROR_SIZE]{};
+
+  uint64_t dirty_mask_{0};
+  uint32_t uart_clear_micros_{0};
 
   uint32_t tx_epoch_{1};
 

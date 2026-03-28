@@ -150,9 +150,28 @@ void NextionSimple::drain_uart_into_ring_() {
       continue;
     }
 
-    for (size_t i = 0; i < to_read; i++) {
-      (void) this->rb_push_(this->rx_read_buf_[i]);
+    // Blokové Soft-DMA kopírování pro maximalizaci propustnosti sběrnice:
+    size_t available_space = (this->rb_tail_ > this->rb_head_) ? 
+                             (this->rb_tail_ - this->rb_head_ - 1) : 
+                             (RB_SIZE - this->rb_head_ + this->rb_tail_ - 1);
+                             
+    if (to_read > available_space) {
+      // Fallback při přetečení fronty (klesneme na byte check z důvodu zahození nejstarších)
+      for (size_t i = 0; i < to_read; i++) {
+        (void) this->rb_push_(this->rx_read_buf_[i]);
+      }
+    } else {
+      // Bleskový zápis přes interní C++ instrukční blok paměti
+      size_t till_end = RB_SIZE - this->rb_head_;
+      if (to_read <= till_end) {
+        memcpy(&this->rx_rb_[this->rb_head_], this->rx_read_buf_, to_read);
+      } else {
+        memcpy(&this->rx_rb_[this->rb_head_], this->rx_read_buf_, till_end);
+        memcpy(&this->rx_rb_[0], this->rx_read_buf_ + till_end, to_read - till_end);
+      }
+      this->rb_head_ = (this->rb_head_ + to_read) & (RB_SIZE - 1);
     }
+    
     drained += static_cast<uint32_t>(to_read);
   }
 
@@ -451,7 +470,26 @@ NextionSimple::TxMirrorEntry *NextionSimple::txm_find_or_alloc_(uint32_t key) {
     return &e;
   }
 
-  auto &e = this->txm_[key & (TX_MIRROR_SIZE - 1)];
+  // Cache is completely full (64 items). Bulletproof Eviction:
+  // We must NOT evict an item that is currently marked 'dirty' (pending transmission),
+  // otherwise the Nextion will silently lose that command update!
+  idx = key & (TX_MIRROR_SIZE - 1);
+  for (size_t i = 0; i < TX_MIRROR_SIZE; i++) {
+    if (!this->txm_[idx].dirty) {
+      auto &e = this->txm_[idx];
+      e = TxMirrorEntry{};
+      e.used = true;
+      e.key = key;
+      e.epoch = this->tx_epoch_;
+      return &e;
+    }
+    idx = (idx + 1) & (TX_MIRROR_SIZE - 1);
+  }
+
+  // Fallback: If ALL 64 items are dirty simultaneously, forceful direct-mapped overwrite.
+  // This situation is extremely rare in a paced UART loop.
+  idx = key & (TX_MIRROR_SIZE - 1);
+  auto &e = this->txm_[idx];
   e = TxMirrorEntry{};
   e.used = true;
   e.key = key;
@@ -459,23 +497,7 @@ NextionSimple::TxMirrorEntry *NextionSimple::txm_find_or_alloc_(uint32_t key) {
   return &e;
 }
 
-uint32_t NextionSimple::txm_min_dirty_epoch_() const {
-  uint32_t min_epoch = UINT32_MAX;
-  for (const auto &e : this->txm_) {
-    if (e.used && e.dirty && e.epoch < min_epoch) {
-      min_epoch = e.epoch;
-    }
-  }
-  return min_epoch;
-}
 
-NextionSimple::TxMirrorEntry *NextionSimple::txm_pick_dirty_for_epoch_(uint32_t epoch) {
-  for (auto &e : this->txm_) {
-    if (e.used && e.dirty && e.epoch == epoch)
-      return &e;
-  }
-  return nullptr;
-}
 
 bool NextionSimple::txm_build_command_(const TxMirrorEntry &e) {
   this->tx_begin_();
@@ -531,6 +553,8 @@ bool NextionSimple::txm_set_prop_int_(const std::string &component_name, const c
   e->epoch = this->tx_epoch_;
   if (data_changed || epoch_changed) {
     e->dirty = true;
+    size_t idx = e - this->txm_;
+    this->dirty_mask_ |= (1ULL << idx);
   }
 
   return true;
@@ -556,6 +580,8 @@ bool NextionSimple::txm_set_vis_(const std::string &component_name, int state) {
   e->epoch = this->tx_epoch_;
   if (data_changed || epoch_changed) {
     e->dirty = true;
+    size_t idx = e - this->txm_;
+    this->dirty_mask_ |= (1ULL << idx);
   }
 
   return true;
@@ -580,6 +606,8 @@ bool NextionSimple::txm_set_text_(const std::string &component_name, const std::
   e->epoch = this->tx_epoch_;
   if (data_changed || epoch_changed) {
     e->dirty = true;
+    size_t idx = e - this->txm_;
+    this->dirty_mask_ |= (1ULL << idx);
   }
 
   return true;
@@ -589,38 +617,20 @@ void NextionSimple::tx_flush_() {
   if (this->uart_parent_ == nullptr)
     return;
 
-  const uint32_t first_dirty_epoch = this->txm_min_dirty_epoch_();
-  if (!this->txq_has_raw_() && first_dirty_epoch == UINT32_MAX) {
+  const uint32_t now = micros();
+  if (this->uart_clear_micros_ != 0 && static_cast<int32_t>(now - this->uart_clear_micros_) < 0) {
+    // Hardware is still transmitting physical layer bytes using Baud limitation - Yield!
+    return;
+  }
+
+  if (!this->txq_has_raw_() && this->dirty_mask_ == 0) {
     this->txq_log_overflow_if_needed_();
     return;
   }
 
-  const uint32_t deadline_us = micros() + this->tx_time_budget_us_;
+  const uint32_t deadline_us = now + this->tx_time_budget_us_;
   uint8_t sent = 0;
-
-  uint8_t batch[384];
-  size_t batch_len = 0;
-  auto flush_batch = [&]() {
-    if (batch_len == 0)
-      return;
-    this->uart_parent_->write_array(batch, batch_len);
-    batch_len = 0;
-  };
-
-  auto enqueue_bytes = [&](const uint8_t *data, size_t len) {
-    if (data == nullptr || len == 0)
-      return;
-    if (len > sizeof(batch)) {
-      flush_batch();
-      this->uart_parent_->write_array(data, len);
-      return;
-    }
-    if (batch_len + len > sizeof(batch)) {
-      flush_batch();
-    }
-    memcpy(batch + batch_len, data, len);
-    batch_len += len;
-  };
+  uint32_t bytes_sent_this_tick = 0;
 
   TxEntry raw{};
   while (sent < this->tx_max_per_loop_) {
@@ -628,15 +638,27 @@ void NextionSimple::tx_flush_() {
       break;
 
     this->txq_prune_tombstones_();
-    const uint32_t min_dirty_epoch = this->txm_min_dirty_epoch_();
-    const bool has_dirty = (min_dirty_epoch != UINT32_MAX);
+    const bool has_dirty = (this->dirty_mask_ != 0);
     const bool has_raw = this->txq_has_raw_();
 
     if (!has_dirty && !has_raw)
       break;
 
     bool send_dirty = false;
+    size_t best_idx = 64;
+
     if (has_dirty) {
+      uint32_t min_dirty_epoch = UINT32_MAX;
+      uint64_t mask = this->dirty_mask_;
+      while (mask != 0) {
+        int tz = __builtin_ctzll(mask);
+        mask &= ~(1ULL << tz);
+        if (this->txm_[tz].epoch < min_dirty_epoch) {
+          min_dirty_epoch = this->txm_[tz].epoch;
+          best_idx = tz;
+        }
+      }
+
       if (!has_raw) {
         send_dirty = true;
       } else {
@@ -647,22 +669,25 @@ void NextionSimple::tx_flush_() {
       }
     }
 
-    if (send_dirty) {
-      auto *m = this->txm_pick_dirty_for_epoch_(min_dirty_epoch);
-      if (m == nullptr)
-        continue;
+    if (send_dirty && best_idx < 64) {
+      auto *m = &this->txm_[best_idx];
 
       if (!this->txm_build_command_(*m)) {
         m->dirty = false;
+        this->dirty_mask_ &= ~(1ULL << best_idx);
         continue;
       }
 
       this->tx_buf_[this->tx_len_] = 0xFF;
       this->tx_buf_[this->tx_len_ + 1] = 0xFF;
       this->tx_buf_[this->tx_len_ + 2] = 0xFF;
-      enqueue_bytes(this->tx_buf_, this->tx_len_ + 3);
+      
+      const size_t len = this->tx_len_ + 3;
+      this->uart_parent_->write_array(this->tx_buf_, len);
+      bytes_sent_this_tick += static_cast<uint32_t>(len);
 
       m->dirty = false;
+      this->dirty_mask_ &= ~(1ULL << best_idx);
       sent++;
       continue;
     }
@@ -670,12 +695,20 @@ void NextionSimple::tx_flush_() {
     if (!this->txq_pop_(raw))
       continue;
 
-    enqueue_bytes(raw.data, raw.len);
+    this->uart_parent_->write_array(raw.data, raw.len);
+    bytes_sent_this_tick += static_cast<uint32_t>(raw.len);
     sent++;
   }
 
-  flush_batch();
   this->txq_log_overflow_if_needed_();
+
+  if (bytes_sent_this_tick > 0) {
+    const uint32_t baud = this->uart_parent_->get_baud_rate();
+    // (1 start + 8 data + 1 stop bit) = 10 bits per byte. 
+    // Time in microseconds = (bytes * 10 * 1000000) / baud
+    const uint32_t transmit_time_us = (bytes_sent_this_tick * 10ULL * 1000000ULL) / baud;
+    this->uart_clear_micros_ = micros() + transmit_time_us;
+  }
 }
 
 // ================= TX builders =================
@@ -843,17 +876,25 @@ void NextionSimple::set_component_text_printf(const std::string &component_name,
   if (format == nullptr)
     return;
 
-  char text[160];
-
   va_list ap;
   va_start(ap, format);
-  const int tn = vsnprintf(text, sizeof(text), format, ap);
+  va_list ap_copy;
+  va_copy(ap_copy, ap);
+  
+  const int tn = vsnprintf(nullptr, 0, format, ap_copy);
+  va_end(ap_copy);
+
+  if (tn <= 0) {
+    va_end(ap);
+    return;
+  }
+
+  std::string text;
+  text.resize(tn);
+  vsnprintf(&text[0], tn + 1, format, ap);
   va_end(ap);
 
-  if (tn <= 0)
-    return;
-
-  this->send_set_text_(component_name, text);
+  this->send_set_text_(component_name, text.c_str());
 }
 
 void NextionSimple::set_component_picc(const std::string &component_name, int value) {
