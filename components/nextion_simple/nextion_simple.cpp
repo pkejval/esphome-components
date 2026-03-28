@@ -116,9 +116,10 @@ void NextionSimple::drain_uart_into_ring_() {
 
   const uint32_t start_us = micros();
   uint32_t drained = 0;
+  uint8_t drain_iters = 0;
 
   while (this->uart_parent_->available() && drained < this->rx_drain_max_per_loop_) {
-    if ((micros() - start_us) >= this->rx_time_budget_us_)
+    if ((++drain_iters & 0x03) == 0 && (micros() - start_us) >= this->rx_time_budget_us_)
       break;
 
     size_t avail = static_cast<size_t>(this->uart_parent_->available());
@@ -180,10 +181,12 @@ void NextionSimple::drain_uart_into_ring_() {
 
 bool NextionSimple::parse_from_ring_(RxFilter filter) {
   const uint32_t start_us = micros();
+  const uint32_t start_ms = millis();
   uint8_t b;
+  uint8_t parse_iters = 0;
 
   while (this->rb_pop_(b)) {
-    if ((micros() - start_us) >= this->rx_time_budget_us_) {
+    if ((++parse_iters & 0x0F) == 0 && (micros() - start_us) >= this->rx_time_budget_us_) {
       return false;
     }
 
@@ -197,14 +200,15 @@ bool NextionSimple::parse_from_ring_(RxFilter filter) {
       this->frame_len_ = 1;
       this->ff_term_ = 0;
       this->frame_overflow_ = false;
-      this->frame_start_ms_ = millis();
+      this->frame_start_ms_ = start_ms;
       this->frame_bytes_seen_ = 1;
       continue;
     }
 
     this->frame_bytes_seen_++;
-    const uint32_t now_ms = millis();
-    if ((now_ms - this->frame_start_ms_) > this->frame_timeout_ms_ ||
+    // Since this loop has a strict microsecond budget, millis() won't advance significantly.
+    // Using start_ms avoids calling millis() for every parsed byte.
+    if ((start_ms - this->frame_start_ms_) > this->frame_timeout_ms_ ||
         this->frame_bytes_seen_ > this->frame_max_bytes_seen_) {
       this->in_frame_ = false;
       this->frame_len_ = 0;
@@ -617,14 +621,15 @@ void NextionSimple::tx_flush_() {
   if (this->uart_parent_ == nullptr)
     return;
 
-  const uint32_t now = micros();
-  if (this->uart_clear_micros_ != 0 && static_cast<int32_t>(now - this->uart_clear_micros_) < 0) {
-    // Hardware is still transmitting physical layer bytes using Baud limitation - Yield!
+  // Extremely fast idle path without calling micros()
+  if (!this->txq_has_raw_() && this->dirty_mask_ == 0) {
+    this->txq_log_overflow_if_needed_();
     return;
   }
 
-  if (!this->txq_has_raw_() && this->dirty_mask_ == 0) {
-    this->txq_log_overflow_if_needed_();
+  const uint32_t now = micros();
+  if (this->uart_clear_micros_ != 0 && static_cast<int32_t>(now - this->uart_clear_micros_) < 0) {
+    // Hardware is still transmitting physical layer bytes using Baud limitation - Yield!
     return;
   }
 
