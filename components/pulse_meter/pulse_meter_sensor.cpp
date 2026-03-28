@@ -327,7 +327,8 @@ void PulseMeterSensor::loop() {
     cnt -= 1;
   }
 
-  if (trise != tdet && time_reached_(now, trise + this->filter_us_)) {
+  const uint32_t edge_timeout_us = (this->filter_mode_ == FILTER_PULSE && this->min_high_us_ > 0) ? this->min_high_us_ : this->filter_us_;
+  if (trise != tdet && time_reached_(now, trise + edge_timeout_us)) {
     this->peeked_edge_ = true;
     tdet = trise;
     cnt += 1;
@@ -488,13 +489,12 @@ void IRAM_ATTR PulseMeterSensor::pulse_intr_sample_(PulseMeterSensor *sensor, ui
   bool latched = st.latched_;
 
   const uint32_t dt_us = now - last_intr;
-  const bool long_enough = dt_us >= sensor->filter_us_;
 
-  if (long_enough && latched && !prev_pin) {
+  if (latched && !prev_pin) {
     if (dt_us >= sensor->min_low_us_) {
       latched = false;
     }
-  } else if (long_enough && !latched && prev_pin) {
+  } else if (!latched && prev_pin) {
     if (dt_us >= sensor->min_high_us_) {
       latched = true;
       set.last_detected_edge_us_ = last_intr;
