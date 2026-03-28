@@ -524,21 +524,16 @@ void PulseCounterSensor::process_pending_() {
   }
 
   if (this->total_sensor_ != nullptr) {
-    const int64_t delta = this->pending_total_delta_.exchange(0, std::memory_order_acq_rel);
+    if (this->pending_total_delta_.load(std::memory_order_acquire) != 0 || !this->total_ever_published_) {
+      const int64_t delta = this->pending_total_delta_.exchange(0, std::memory_order_acq_rel);
 
-    if (delta != 0 || !this->total_ever_published_) {
-      int64_t abs_total = this->storage_->read_total();
-      if (abs_total < 0)
-        abs_total = 0;
-
-      if (abs_total == 0 && (this->published_total_ != 0 || delta != 0)) {
-        this->published_total_ = std::max<int64_t>(0, this->published_total_ + delta);
-      } else {
-        this->published_total_ = abs_total;
+      if (delta != 0 || !this->total_ever_published_) {
+        if (delta != 0) {
+          this->published_total_ = std::max<int64_t>(0, this->published_total_ + delta);
+        }
+        this->total_sensor_->publish_state(static_cast<float>(this->published_total_));
+        this->total_ever_published_ = true;
       }
-
-      this->total_sensor_->publish_state(static_cast<float>(this->published_total_));
-      this->total_ever_published_ = true;
     }
   }
 }
@@ -564,10 +559,9 @@ void PulseCounterSensor::update() {
   this->last_time_us_ = t;
 
   if (this->total_sensor_ != nullptr) {
-    int64_t abs_total = this->storage_->read_total();
-    if (abs_total < 0)
-      abs_total = 0;
-    this->published_total_ = abs_total;
+    if (delta != 0) {
+      this->published_total_ = std::max<int64_t>(0, this->published_total_ + delta);
+    }
     this->total_sensor_->publish_state(static_cast<float>(this->published_total_));
     this->total_ever_published_ = true;
   }
