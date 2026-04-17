@@ -44,7 +44,7 @@
 #define ESPHOME_PULSE_COUNTER_HAS_ARDUINO 0
 #endif
 
-#if SOC_PCNT_SUPPORTED
+#if SOC_PCNT_SUPPORTED && __has_include(<driver/pulse_cnt.h>)
 #include <driver/pulse_cnt.h>
 #define HAS_PCNT
 #endif

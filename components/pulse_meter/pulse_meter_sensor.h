@@ -204,12 +204,13 @@ class PulseMeterSensor : public sensor::Sensor, public Component {
   volatile uint32_t coalesce_until_us_{0};
   uint32_t coalesce_min_us_{0};
 
+  bool use_rmt_{false};
+
 #if defined(ESP_IDF_VERSION) && __has_include("driver/gpio_filter.h")
   gpio_glitch_filter_handle_t glitch_filter_{nullptr};
 #endif
 
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
-  bool use_rmt_{false};
   rmt_channel_handle_t rmt_rx_channel_{nullptr};
   rmt_receive_config_t rmt_rx_cfg_{};
   uint32_t rmt_resolution_hz_{1000000UL};
