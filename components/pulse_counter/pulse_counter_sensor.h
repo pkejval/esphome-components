@@ -174,7 +174,7 @@ class PulseCounterSensor : public sensor::Sensor, public PollingComponent {
   void loop() override;
   void update() override;
   void dump_config() override;
-  void set_update_interval(uint32_t update_interval) override;
+  void set_update_interval(uint32_t update_interval);
 
  protected:
 #if defined(USE_ESP32)
