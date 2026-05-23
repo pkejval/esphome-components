@@ -395,8 +395,10 @@ void NextionSimple::diagnostic_tick_() {
     }
 
     if (millis() >= this->diag_deadline_ms_) {
-      if (this->page_sync_attempts_left_ > 1) {
-        this->page_sync_attempts_left_--;
+      if (this->page_sync_attempts_left_ == 0 || this->page_sync_attempts_left_ > 1) {
+        if (this->page_sync_attempts_left_ > 1) {
+          this->page_sync_attempts_left_--;
+        }
         ESP_LOGW(TAG, "Nextion page %d not confirmed, retrying (%u attempt(s) left)",
                  this->page_sync_target_, static_cast<unsigned>(this->page_sync_attempts_left_));
         this->saw_expected_reply_ = false;
@@ -1008,9 +1010,6 @@ void NextionSimple::set_page(const std::string &page_name) {
 void NextionSimple::set_page_verified(int page, uint8_t retries, uint32_t verify_timeout_ms) {
   if (page < 0 || this->uart_parent_ == nullptr || this->upload_in_progress_)
     return;
-
-  if (retries == 0)
-    retries = 1;
 
   this->page_sync_active_ = true;
   this->page_sync_target_ = page;
