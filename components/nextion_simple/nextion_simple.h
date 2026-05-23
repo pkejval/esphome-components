@@ -45,6 +45,7 @@ class NextionSimple : public Component {
   void set_component_visibility(const std::string &component_name, int state);
   void set_page(int page);
   void set_page(const std::string &page_name);
+  void set_page_verified(int page, uint8_t retries = 3, uint32_t verify_timeout_ms = 250);
 
   // Low-level send (raw -> barrier)
   void send_command(const char *cmd, size_t len);
@@ -284,6 +285,10 @@ class NextionSimple : public Component {
   uint32_t original_baud_rate_{0};
   uint32_t tft_size_{0};
   uint32_t content_length_{0};
+
+  bool page_sync_active_{false};
+  int page_sync_target_{-1};
+  uint8_t page_sync_attempts_left_{0};
 
   NxMode mode_{NxMode::INIT};
 
