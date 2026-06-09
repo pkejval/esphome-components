@@ -31,6 +31,19 @@ uint32_t NextionSimple::make_coalesce_key_(uint32_t comp_hash, TxCoalesceKind ki
   return ((comp_hash ^ (comp_hash >> 16) ^ (comp_hash >> 8)) << 8) | static_cast<uint32_t>(kind);
 }
 
+namespace {
+
+static uint32_t mix32_(uint32_t x) {
+  x ^= x >> 16;
+  x *= 0x7feb352dU;
+  x ^= x >> 15;
+  x *= 0x846ca68bU;
+  x ^= x >> 16;
+  return x;
+}
+
+}  // namespace
+
 void NextionSimple::dump_config() {
   ESP_LOGCONFIG(TAG, "Nextion Simple:");
   ESP_LOGCONFIG(TAG, "  TFT URL: %s", this->tft_url_.c_str());
@@ -94,19 +107,52 @@ void NextionSimple::reset_rx_state_() {
 static inline bool is_init_start(uint8_t b) { return b == 0x66 || b == 0x88 || b == 0x00; }
 static inline bool is_diag_start(uint8_t b) { return b == 0x70 || b == 0x71; }
 
+bool NextionSimple::rb_find_next_frame_start_(RxFilter filter, uint8_t &b, uint32_t start_us, uint8_t &parse_iters) {
+  const size_t mask = RB_SIZE - 1;
+
+  while (this->rb_head_ != this->rb_tail_) {
+    const size_t chunk = (this->rb_head_ > this->rb_tail_) ? (this->rb_head_ - this->rb_tail_) : (RB_SIZE - this->rb_tail_);
+    const uint8_t *src = &this->rx_rb_[this->rb_tail_];
+    size_t consumed = 0;
+
+    for (size_t i = 0; i < chunk; i++) {
+      const uint8_t c = src[i];
+      const bool start = (filter == RxFilter::INIT_ONLY) ? is_init_start(c) : is_diag_start(c);
+      if (start) {
+        this->rb_tail_ = (this->rb_tail_ + i + 1) & mask;
+        b = c;
+        return true;
+      }
+
+      consumed = i + 1;
+
+      if ((++parse_iters & 0x0F) == 0 && (micros() - start_us) >= this->rx_time_budget_us_) {
+        this->rb_tail_ = (this->rb_tail_ + consumed) & mask;
+        return false;
+      }
+    }
+
+    this->rb_tail_ = (this->rb_tail_ + chunk) & mask;
+  }
+
+  return false;
+}
+
 void NextionSimple::log_rx_drops_if_needed_() {
   const uint32_t now = millis();
 
-  if (this->rx_rb_drop_count_ != 0 && (now - this->rx_rb_drop_last_log_ms_ >= 1000)) {
-    ESP_LOGW(TAG, "RX ring dropped %" PRIu32 " byte(s) in last ~1s", this->rx_rb_drop_count_);
+  if (this->rx_rb_drop_count_ != 0 && (now - this->rx_rb_drop_last_log_ms_ >= this->rx_rb_drop_log_interval_ms_)) {
+    ESP_LOGW(TAG, "RX ring dropped %" PRIu32 " byte(s) in recent interval", this->rx_rb_drop_count_);
     this->rx_rb_drop_count_ = 0;
     this->rx_rb_drop_last_log_ms_ = now;
+    this->rx_rb_drop_log_interval_ms_ = this->rx_rb_drop_log_interval_ms_ < 60000 ? this->rx_rb_drop_log_interval_ms_ * 2 : 60000;
   }
 
-  if (this->rx_frame_drop_count_ != 0 && (now - this->rx_frame_drop_last_log_ms_ >= 1000)) {
-    ESP_LOGW(TAG, "Dropped %" PRIu32 " RX frame(s) due to overflow in last ~1s", this->rx_frame_drop_count_);
+  if (this->rx_frame_drop_count_ != 0 && (now - this->rx_frame_drop_last_log_ms_ >= this->rx_frame_drop_log_interval_ms_)) {
+    ESP_LOGW(TAG, "Dropped %" PRIu32 " RX frame(s) due to overflow in recent interval", this->rx_frame_drop_count_);
     this->rx_frame_drop_count_ = 0;
     this->rx_frame_drop_last_log_ms_ = now;
+    this->rx_frame_drop_log_interval_ms_ = this->rx_frame_drop_log_interval_ms_ < 60000 ? this->rx_frame_drop_log_interval_ms_ * 2 : 60000;
   }
 }
 
@@ -133,12 +179,33 @@ void NextionSimple::drain_uart_into_ring_() {
     if (to_read > sizeof(this->rx_read_buf_))
       to_read = sizeof(this->rx_read_buf_);
 
+    const size_t available_space = (this->rb_tail_ > this->rb_head_)
+                                        ? (this->rb_tail_ - this->rb_head_ - 1)
+                                        : (RB_SIZE - this->rb_head_ + this->rb_tail_ - 1);
+
     if (to_read <= 1) {
       uint8_t b;
       if (!this->uart_parent_->read_byte(&b))
         break;
       (void) this->rb_push_(b);
       drained++;
+      continue;
+    }
+
+    if (to_read <= available_space) {
+      const size_t till_end = RB_SIZE - this->rb_head_;
+      if (to_read <= till_end) {
+        if (!this->uart_parent_->read_array(&this->rx_rb_[this->rb_head_], to_read))
+          break;
+      } else {
+        if (!this->uart_parent_->read_array(&this->rx_rb_[this->rb_head_], till_end))
+          break;
+        if (!this->uart_parent_->read_array(&this->rx_rb_[0], to_read - till_end))
+          break;
+      }
+
+      this->rb_head_ = (this->rb_head_ + to_read) & (RB_SIZE - 1);
+      drained += static_cast<uint32_t>(to_read);
       continue;
     }
 
@@ -151,28 +218,10 @@ void NextionSimple::drain_uart_into_ring_() {
       continue;
     }
 
-    // Blokové Soft-DMA kopírování pro maximalizaci propustnosti sběrnice:
-    size_t available_space = (this->rb_tail_ > this->rb_head_) ? 
-                             (this->rb_tail_ - this->rb_head_ - 1) : 
-                             (RB_SIZE - this->rb_head_ + this->rb_tail_ - 1);
-                             
-    if (to_read > available_space) {
-      // Fallback při přetečení fronty (klesneme na byte check z důvodu zahození nejstarších)
-      for (size_t i = 0; i < to_read; i++) {
-        (void) this->rb_push_(this->rx_read_buf_[i]);
-      }
-    } else {
-      // Bleskový zápis přes interní C++ instrukční blok paměti
-      size_t till_end = RB_SIZE - this->rb_head_;
-      if (to_read <= till_end) {
-        memcpy(&this->rx_rb_[this->rb_head_], this->rx_read_buf_, to_read);
-      } else {
-        memcpy(&this->rx_rb_[this->rb_head_], this->rx_read_buf_, till_end);
-        memcpy(&this->rx_rb_[0], this->rx_read_buf_ + till_end, to_read - till_end);
-      }
-      this->rb_head_ = (this->rb_head_ + to_read) & (RB_SIZE - 1);
+    for (size_t i = 0; i < to_read; i++) {
+      (void) this->rb_push_(this->rx_read_buf_[i]);
     }
-    
+
     drained += static_cast<uint32_t>(to_read);
   }
 
@@ -185,15 +234,10 @@ bool NextionSimple::parse_from_ring_(RxFilter filter) {
   uint8_t b;
   uint8_t parse_iters = 0;
 
-  while (this->rb_pop_(b)) {
-    if ((++parse_iters & 0x0F) == 0 && (micros() - start_us) >= this->rx_time_budget_us_) {
-      return false;
-    }
-
+  while (true) {
     if (!this->in_frame_) {
-      const bool start = (filter == RxFilter::INIT_ONLY) ? is_init_start(b) : is_diag_start(b);
-      if (!start)
-        continue;
+      if (!this->rb_find_next_frame_start_(filter, b, start_us, parse_iters))
+        return false;
 
       this->in_frame_ = true;
       this->frame_buf_[0] = b;
@@ -203,6 +247,13 @@ bool NextionSimple::parse_from_ring_(RxFilter filter) {
       this->frame_start_ms_ = start_ms;
       this->frame_bytes_seen_ = 1;
       continue;
+    }
+
+    if (!this->rb_pop_(b))
+      return false;
+
+    if ((++parse_iters & 0x0F) == 0 && (micros() - start_us) >= this->rx_time_budget_us_) {
+      return false;
     }
 
     this->frame_bytes_seen_++;
@@ -504,10 +555,13 @@ void NextionSimple::txq_log_overflow_if_needed_() {
     return;
 
   const uint32_t now = millis();
-  if (now - this->txq_overflow_last_log_ms_ >= 1000) {
-    ESP_LOGW(TAG, "TX queue overflow: dropped %" PRIu32 " cmd(s) in last ~1s", this->txq_drop_count_);
+  if (now - this->txq_overflow_last_log_ms_ >= this->txq_overflow_log_interval_ms_) {
+    ESP_LOGW(TAG, "TX queue overflow: dropped %" PRIu32 " cmd(s) in recent interval", this->txq_drop_count_);
     this->txq_drop_count_ = 0;
     this->txq_overflow_last_log_ms_ = now;
+    this->txq_overflow_log_interval_ms_ = this->txq_overflow_log_interval_ms_ < 60000
+                                              ? this->txq_overflow_log_interval_ms_ * 2
+                                              : 60000;
   }
   this->txq_overflow_ = false;
 }
@@ -516,7 +570,9 @@ NextionSimple::TxMirrorEntry *NextionSimple::txm_find_or_alloc_(uint32_t key) {
   if (key == 0)
     return nullptr;
 
-  size_t idx = key & (TX_MIRROR_SIZE - 1);
+  constexpr size_t mask = TX_MIRROR_SIZE - 1;
+  size_t idx = mix32_(key) & mask;
+  size_t step = (mix32_(key ^ 0x9e3779b9U) | 1U) & mask;
   size_t first_free = TX_MIRROR_SIZE;
 
   for (size_t i = 0; i < TX_MIRROR_SIZE; i++) {
@@ -525,7 +581,7 @@ NextionSimple::TxMirrorEntry *NextionSimple::txm_find_or_alloc_(uint32_t key) {
       return &e;
     if (!e.used && first_free == TX_MIRROR_SIZE)
       first_free = idx;
-    idx = (idx + 1) & (TX_MIRROR_SIZE - 1);
+    idx = (idx + step) & mask;
   }
 
   if (first_free != TX_MIRROR_SIZE) {
@@ -540,7 +596,7 @@ NextionSimple::TxMirrorEntry *NextionSimple::txm_find_or_alloc_(uint32_t key) {
   // Cache is completely full (64 items). Bulletproof Eviction:
   // We must NOT evict an item that is currently marked 'dirty' (pending transmission),
   // otherwise the Nextion will silently lose that command update!
-  idx = key & (TX_MIRROR_SIZE - 1);
+  idx = mix32_(key) & mask;
   for (size_t i = 0; i < TX_MIRROR_SIZE; i++) {
     if (!this->txm_[idx].dirty) {
       auto &e = this->txm_[idx];
@@ -550,12 +606,12 @@ NextionSimple::TxMirrorEntry *NextionSimple::txm_find_or_alloc_(uint32_t key) {
       e.epoch = this->tx_epoch_;
       return &e;
     }
-    idx = (idx + 1) & (TX_MIRROR_SIZE - 1);
+    idx = (idx + step) & mask;
   }
 
   // Fallback: If ALL 64 items are dirty simultaneously, forceful direct-mapped overwrite.
   // This situation is extremely rare in a paced UART loop.
-  idx = key & (TX_MIRROR_SIZE - 1);
+  idx = mix32_(key) & mask;
   auto &e = this->txm_[idx];
   e = TxMirrorEntry{};
   e.used = true;
@@ -566,7 +622,9 @@ NextionSimple::TxMirrorEntry *NextionSimple::txm_find_or_alloc_(uint32_t key) {
 
 
 
-bool NextionSimple::txm_build_command_(const TxMirrorEntry &e) {
+bool NextionSimple::txm_build_command_(TxMirrorEntry &e) {
+  e.cmd_len = 0;
+
   this->tx_begin_();
   bool ok = true;
 
@@ -597,28 +655,44 @@ bool NextionSimple::txm_build_command_(const TxMirrorEntry &e) {
       return false;
   }
 
-  return ok;
+  if (!ok) {
+    e.cmd_len = 0;
+    return false;
+  }
+
+  this->tx_buf_[this->tx_len_] = 0xFF;
+  this->tx_buf_[this->tx_len_ + 1] = 0xFF;
+  this->tx_buf_[this->tx_len_ + 2] = 0xFF;
+
+  e.cmd_len = static_cast<uint16_t>(this->tx_len_ + 3);
+  memcpy(e.cmd_buf, this->tx_buf_, e.cmd_len);
+  return true;
 }
 
 bool NextionSimple::txm_set_prop_int_(const std::string &component_name, const char *prop, TxCoalesceKind kind, int value) {
+  const char *prop_text = prop == nullptr ? "" : prop;
   const uint32_t key = make_coalesce_key_(fnv1a32_(component_name.c_str()), kind);
   auto *e = this->txm_find_or_alloc_(key);
   if (e == nullptr)
     return false;
 
-  const bool data_changed = e->kind != TxMirrorKind::PROP_INT || e->component != component_name || e->prop != prop ||
+  const bool data_changed = e->kind != TxMirrorKind::PROP_INT || e->component != component_name || e->prop != prop_text ||
                             e->int_value != value;
   const bool epoch_changed = e->epoch != this->tx_epoch_;
 
   if (data_changed) {
     e->kind = TxMirrorKind::PROP_INT;
     e->component = component_name;
-    e->prop = prop;
+    e->prop = prop_text;
     e->int_value = value;
   }
 
-  e->epoch = this->tx_epoch_;
+  if (data_changed) {
+    e->cmd_len = 0;
+  }
+
   if (data_changed || epoch_changed) {
+    e->epoch = this->tx_epoch_;
     e->dirty = true;
     size_t idx = e - this->txm_;
     this->dirty_mask_ |= (1ULL << idx);
@@ -644,8 +718,12 @@ bool NextionSimple::txm_set_vis_(const std::string &component_name, int state) {
     e->int_value = state;
   }
 
-  e->epoch = this->tx_epoch_;
+  if (data_changed) {
+    e->cmd_len = 0;
+  }
+
   if (data_changed || epoch_changed) {
+    e->epoch = this->tx_epoch_;
     e->dirty = true;
     size_t idx = e - this->txm_;
     this->dirty_mask_ |= (1ULL << idx);
@@ -654,24 +732,29 @@ bool NextionSimple::txm_set_vis_(const std::string &component_name, int state) {
   return true;
 }
 
-bool NextionSimple::txm_set_text_(const std::string &component_name, const std::string &text) {
+bool NextionSimple::txm_set_text_(const std::string &component_name, const char *text) {
+  const char *text_ptr = text == nullptr ? "" : text;
   const uint32_t key = make_coalesce_key_(fnv1a32_(component_name.c_str()), TxCoalesceKind::TXT);
   auto *e = this->txm_find_or_alloc_(key);
   if (e == nullptr)
     return false;
 
-  const bool data_changed = e->kind != TxMirrorKind::TXT || e->component != component_name || e->text != text;
+  const bool data_changed = e->kind != TxMirrorKind::TXT || e->component != component_name || e->text != text_ptr;
   const bool epoch_changed = e->epoch != this->tx_epoch_;
 
   if (data_changed) {
     e->kind = TxMirrorKind::TXT;
     e->component = component_name;
     e->prop.clear();
-    e->text = text;
+    e->text = text_ptr;
   }
 
-  e->epoch = this->tx_epoch_;
+  if (data_changed) {
+    e->cmd_len = 0;
+  }
+
   if (data_changed || epoch_changed) {
+    e->epoch = this->tx_epoch_;
     e->dirty = true;
     size_t idx = e - this->txm_;
     this->dirty_mask_ |= (1ULL << idx);
@@ -696,12 +779,24 @@ void NextionSimple::tx_flush_() {
     return;
   }
 
-  const uint32_t deadline_us = now + this->tx_time_budget_us_;
+  const size_t backlog = this->txq_count_() + static_cast<size_t>(__builtin_popcountll(this->dirty_mask_));
+  uint8_t max_per_loop = this->tx_max_per_loop_;
+  uint32_t budget_us = this->tx_time_budget_us_;
+  if (backlog > (TXQ_SIZE / 2)) {
+    max_per_loop = static_cast<uint8_t>(max_per_loop * 2);
+    budget_us += this->tx_time_budget_us_ / 2;
+  }
+  if (backlog > ((TXQ_SIZE * 3) / 4)) {
+    max_per_loop = static_cast<uint8_t>(max_per_loop * 2);
+    budget_us += this->tx_time_budget_us_;
+  }
+
+  const uint32_t deadline_us = now + budget_us;
   uint8_t sent = 0;
   uint32_t bytes_sent_this_tick = 0;
 
   TxEntry raw{};
-  while (sent < this->tx_max_per_loop_) {
+  while (sent < max_per_loop) {
     if (static_cast<int32_t>(micros() - deadline_us) >= 0)
       break;
 
@@ -713,7 +808,7 @@ void NextionSimple::tx_flush_() {
       break;
 
     bool send_dirty = false;
-    size_t best_idx = 64;
+    size_t best_idx = TX_MIRROR_SIZE;
 
     if (has_dirty) {
       uint32_t min_dirty_epoch = UINT32_MAX;
@@ -737,21 +832,17 @@ void NextionSimple::tx_flush_() {
       }
     }
 
-    if (send_dirty && best_idx < 64) {
+    if (send_dirty && best_idx < TX_MIRROR_SIZE) {
       auto *m = &this->txm_[best_idx];
 
-      if (!this->txm_build_command_(*m)) {
+      if (m->cmd_len == 0 && !this->txm_build_command_(*m)) {
         m->dirty = false;
         this->dirty_mask_ &= ~(1ULL << best_idx);
         continue;
       }
 
-      this->tx_buf_[this->tx_len_] = 0xFF;
-      this->tx_buf_[this->tx_len_ + 1] = 0xFF;
-      this->tx_buf_[this->tx_len_ + 2] = 0xFF;
-      
-      const size_t len = this->tx_len_ + 3;
-      this->uart_parent_->write_array(this->tx_buf_, len);
+      this->uart_parent_->write_array(m->cmd_buf, m->cmd_len);
+      const size_t len = m->cmd_len;
       bytes_sent_this_tick += static_cast<uint32_t>(len);
 
       m->dirty = false;
@@ -903,24 +994,50 @@ void NextionSimple::send_set_text_(const std::string &component_name, const char
 }
 
 void NextionSimple::send_set_text_formatted_(const std::string &component_name, const std::string &fmt,
-                                            const std::vector<std::string> &args) {
+                                             const std::vector<std::string> &args) {
   if (this->uart_parent_ == nullptr)
     return;
 
-  std::string text;
-  text.reserve(fmt.size() + args.size() * 8);
+  char text[kMaxCmd + 1]{};
+  size_t text_len = 0;
   size_t arg_i = 0;
   const char *p = fmt.c_str();
+  bool overflow = false;
+
+  auto append_char = [&](char c) -> bool {
+    if (text_len >= kMaxCmd)
+      return false;
+    text[text_len++] = c;
+    text[text_len] = '\0';
+    return true;
+  };
+
+  auto append_str = [&](const std::string &s) -> bool {
+    for (char c : s) {
+      if (!append_char(c))
+        return false;
+    }
+    return true;
+  };
 
   while (*p) {
     if (p[0] == '%' && p[1] == 's' && arg_i < args.size()) {
-      text += args[arg_i++];
+      if (!append_str(args[arg_i++]))
+        overflow = true;
       p += 2;
+      if (overflow)
+        break;
       continue;
     }
 
-    text.push_back(*p++);
+    if (!append_char(*p++))
+      overflow = true;
+    if (overflow)
+      break;
   }
+
+  if (overflow)
+    return;
 
   (void) this->txm_set_text_(component_name, text);
 }
@@ -946,23 +1063,14 @@ void NextionSimple::set_component_text_printf(const std::string &component_name,
 
   va_list ap;
   va_start(ap, format);
-  va_list ap_copy;
-  va_copy(ap_copy, ap);
-  
-  const int tn = vsnprintf(nullptr, 0, format, ap_copy);
-  va_end(ap_copy);
-
-  if (tn <= 0) {
-    va_end(ap);
-    return;
-  }
-
-  std::string text;
-  text.resize(tn);
-  vsnprintf(&text[0], tn + 1, format, ap);
+  char text[kMaxCmd + 1]{};
+  const int tn = vsnprintf(text, sizeof(text), format, ap);
   va_end(ap);
 
-  this->send_set_text_(component_name, text.c_str());
+  if (tn <= 0 || tn >= static_cast<int>(sizeof(text)))
+    return;
+
+  this->send_set_text_(component_name, text);
 }
 
 void NextionSimple::set_component_picc(const std::string &component_name, int value) {

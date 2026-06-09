@@ -394,6 +394,7 @@ bool NextionSimple::upload_tft_arduino_() {
 
   // disable replies & return to write-only
   this->send_command_printf("bkcmd=0");
+  this->tx_flush_();
   this->bkcmd_ = 0;
   this->enter_writeonly_mode_();
 
@@ -815,6 +816,7 @@ bool NextionSimple::upload_tft_esp_idf_() {
       this->upload_in_progress_ = false;
 
       this->send_command_printf("bkcmd=0");
+      this->tx_flush_();
       this->bkcmd_ = 0;
       this->enter_writeonly_mode_();
       return false;
@@ -837,6 +839,7 @@ bool NextionSimple::upload_tft_esp_idf_() {
   }
 
   this->send_command_printf("bkcmd=0");
+  this->tx_flush_();
   this->bkcmd_ = 0;
   this->enter_writeonly_mode_();
 

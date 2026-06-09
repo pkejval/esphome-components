@@ -90,6 +90,7 @@ class NextionSimple : public Component {
   enum class RxFilter : uint8_t { INIT_ONLY, DIAG_ONLY };
   bool parse_from_ring_(RxFilter filter);
   void handle_frame_(RxFilter filter, const uint8_t *frame, size_t len_no_term);
+  bool rb_find_next_frame_start_(RxFilter filter, uint8_t &b, uint32_t start_us, uint8_t &parse_iters);
 
   void log_rx_drops_if_needed_();
 
@@ -140,15 +141,19 @@ class NextionSimple : public Component {
     TXT = 3,
   };
 
+  static constexpr size_t kMaxCmd = 256;
+
   struct TxMirrorEntry {
     bool used{false};
     bool dirty{false};
     uint32_t key{0};
     uint32_t epoch{0};
     TxMirrorKind kind{TxMirrorKind::NONE};
+    uint16_t cmd_len{0};
     std::string component;
     std::string prop;
     std::string text;
+    uint8_t cmd_buf[kMaxCmd + 3]{};
     int int_value{0};
   };
 
@@ -163,10 +168,10 @@ class NextionSimple : public Component {
   void tx_flush_();
 
   TxMirrorEntry *txm_find_or_alloc_(uint32_t key);
-  bool txm_build_command_(const TxMirrorEntry &e);
+  bool txm_build_command_(TxMirrorEntry &e);
   bool txm_set_prop_int_(const std::string &component_name, const char *prop, TxCoalesceKind kind, int value);
   bool txm_set_vis_(const std::string &component_name, int state);
-  bool txm_set_text_(const std::string &component_name, const std::string &text);
+  bool txm_set_text_(const std::string &component_name, const char *text);
 
   #if defined(USE_ESP32)
   uint8_t tx_max_per_loop_{6};
@@ -188,6 +193,7 @@ class NextionSimple : public Component {
 
   bool txq_overflow_{false};
   uint32_t txq_overflow_last_log_ms_{0};
+  uint32_t txq_overflow_log_interval_ms_{1000};
   uint32_t txq_drop_count_{0};
 
   // ===== TX (builders) =====
@@ -212,7 +218,6 @@ class NextionSimple : public Component {
   uart::UARTComponent *uart_parent_{nullptr};
   std::string tft_url_;
 
-  static constexpr size_t kMaxCmd = 256;
   uint8_t bkcmd_{3};
   uint8_t tx_buf_[kMaxCmd + 3]{};
   size_t tx_len_{0};
@@ -227,6 +232,7 @@ class NextionSimple : public Component {
   bool rb_overflow_{false};
 
   uint32_t rx_rb_drop_last_log_ms_{0};
+  uint32_t rx_rb_drop_log_interval_ms_{1000};
   uint32_t rx_rb_drop_count_{0};
 
   uint32_t rx_drain_max_per_loop_{256};
@@ -274,6 +280,7 @@ class NextionSimple : public Component {
   uint8_t frame_buf_[FRAME_BUF_SIZE]{};
 
   uint32_t rx_frame_drop_last_log_ms_{0};
+  uint32_t rx_frame_drop_log_interval_ms_{1000};
   uint32_t rx_frame_drop_count_{0};
 
   bool rx_enabled_{true};
