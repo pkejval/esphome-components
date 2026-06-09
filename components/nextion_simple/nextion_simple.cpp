@@ -262,8 +262,17 @@ void NextionSimple::handle_frame_(RxFilter filter, const uint8_t *frame, size_t 
   const uint8_t code = frame[0];
 
   if (filter == RxFilter::DIAG_ONLY) {
-    if (code == 0x70 || code == 0x71)
+    if (code == 0x70 || code == 0x71) {
       this->saw_expected_reply_ = true;
+      return;
+    }
+
+    if (code == 0x66 && len_no_term >= 2) {
+      this->current_page_ = static_cast<int>(frame[1]);
+      this->on_page_callback_.call(this->current_page_);
+      if (this->page_sync_active_ && this->current_page_ == this->page_sync_target_)
+        this->saw_expected_reply_ = true;
+    }
     return;
   }
 
@@ -369,6 +378,54 @@ void NextionSimple::diagnostic_tick_() {
 
   this->drain_uart_into_ring_();
   (void) this->parse_from_ring_(RxFilter::DIAG_ONLY);
+
+  if (this->page_sync_active_) {
+    if (this->saw_expected_reply_ || this->current_page_ == this->page_sync_target_) {
+      this->page_sync_active_ = false;
+      this->page_sync_target_ = -1;
+      this->page_sync_attempts_left_ = 0;
+      if (this->bkcmd_ != 0) {
+        this->send_command_printf("bkcmd=0");
+        this->bkcmd_ = 0;
+      }
+      this->rx_enabled_ = false;
+      this->reset_rx_state_();
+      this->mode_ = NxMode::RUN_WRITEONLY;
+      return;
+    }
+
+    if (millis() >= this->diag_deadline_ms_) {
+      if (this->page_sync_attempts_left_ == 0 || this->page_sync_attempts_left_ > 1) {
+        if (this->page_sync_attempts_left_ > 1) {
+          this->page_sync_attempts_left_--;
+        }
+        ESP_LOGW(TAG, "Nextion page %d not confirmed, retrying (%u attempt(s) left)",
+                 this->page_sync_target_, static_cast<unsigned>(this->page_sync_attempts_left_));
+        this->saw_expected_reply_ = false;
+        this->reset_rx_state_();
+        this->diag_deadline_ms_ = millis() + this->diag_timeout_ms_;
+        this->send_command_printf("page %d", this->page_sync_target_);
+        this->send_command_printf("sendme");
+        return;
+      }
+
+      ESP_LOGW(TAG, "Nextion page %d not confirmed after %u attempt(s)",
+               this->page_sync_target_, static_cast<unsigned>(this->page_sync_attempts_left_));
+      if (this->bkcmd_ != 0) {
+        this->send_command_printf("bkcmd=0");
+        this->bkcmd_ = 0;
+      }
+      this->page_sync_active_ = false;
+      this->page_sync_target_ = -1;
+      this->page_sync_attempts_left_ = 0;
+      this->rx_enabled_ = false;
+      this->reset_rx_state_();
+      this->mode_ = NxMode::RUN_WRITEONLY;
+      return;
+    }
+
+    return;
+  }
 
   if (this->saw_expected_reply_ || millis() >= this->diag_deadline_ms_) {
     if (this->bkcmd_ != 0) {
@@ -954,6 +1011,24 @@ void NextionSimple::set_page(const std::string &page_name) {
   this->send_command_printf("page %s", page_name.c_str());
   this->current_page_ = -1;
   this->on_page_callback_.call(-1);
+}
+
+void NextionSimple::set_page_verified(int page, uint8_t retries, uint32_t verify_timeout_ms) {
+  if (page < 0 || this->uart_parent_ == nullptr || this->upload_in_progress_)
+    return;
+
+  this->page_sync_active_ = true;
+  this->page_sync_target_ = page;
+  this->page_sync_attempts_left_ = retries;
+  this->diag_timeout_ms_ = verify_timeout_ms;
+  this->saw_expected_reply_ = false;
+  this->rx_enabled_ = true;
+  this->reset_rx_state_();
+  this->diag_deadline_ms_ = millis() + this->diag_timeout_ms_;
+  this->mode_ = NxMode::DIAG_CHECK;
+
+  this->send_command_printf("page %d", page);
+  this->send_command_printf("sendme");
 }
 
 // ================= Low-level (raw barrier enqueue) =================
