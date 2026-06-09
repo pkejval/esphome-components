@@ -123,7 +123,11 @@ class NextionSimple : public Component {
     uint32_t epoch{0};            // barrier epoch
   };
 
+  #if defined(USE_ESP32)
+  static constexpr size_t TXQ_SIZE = 64;
+  #else
   static constexpr size_t TXQ_SIZE = 32;
+  #endif
   static_assert((TXQ_SIZE & (TXQ_SIZE - 1)) == 0, "TXQ_SIZE must be power of two");
   static constexpr size_t TX_MIRROR_SIZE = 64;
   static_assert((TX_MIRROR_SIZE & (TX_MIRROR_SIZE - 1)) == 0, "TX_MIRROR_SIZE must be power of two");
@@ -149,6 +153,8 @@ class NextionSimple : public Component {
 
   void txq_prune_tombstones_();
   bool txq_has_raw_() const { return this->txq_head_ != this->txq_tail_; }
+  size_t txq_count_() const { return (this->txq_head_ - this->txq_tail_) & (TXQ_SIZE - 1); }
+  bool txq_near_full_() const { return this->txq_count_() >= (TXQ_SIZE - (TXQ_SIZE / 4)); }
 
   bool txq_push_raw_barrier_(const uint8_t *data, size_t len);
   bool txq_pop_(TxEntry &out);
@@ -161,8 +167,13 @@ class NextionSimple : public Component {
   bool txm_set_vis_(const std::string &component_name, int state);
   bool txm_set_text_(const std::string &component_name, const std::string &text);
 
+  #if defined(USE_ESP32)
+  uint8_t tx_max_per_loop_{6};
+  uint32_t tx_time_budget_us_{3000};
+  #else
   uint8_t tx_max_per_loop_{3};
   uint32_t tx_time_budget_us_{1500};
+  #endif
 
   TxEntry txq_[TXQ_SIZE]{};
   size_t txq_head_{0};

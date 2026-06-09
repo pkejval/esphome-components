@@ -398,6 +398,12 @@ bool NextionSimple::txq_push_raw_barrier_(const uint8_t *data, size_t len) {
 
   this->txq_prune_tombstones_();
 
+  // Try to make room before we start dropping older raw commands.
+  if (this->txq_near_full_()) {
+    this->tx_flush_();
+    this->txq_prune_tombstones_();
+  }
+
   size_t nh = (this->txq_head_ + 1) & (TXQ_SIZE - 1);
   if (nh == this->txq_tail_) {
     this->txq_tail_ = (this->txq_tail_ + 1) & (TXQ_SIZE - 1);
