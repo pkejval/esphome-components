@@ -474,10 +474,29 @@ std::string PcFanController::build_status_json_() const {
     const uint32_t newest_age = this->newest_input_age_ms_();
 
     JsonObject inputs = root["inputs"].to<JsonObject>();
-    inputs["cpu"] = std::isnan(this->input_cpu_) ? nullptr : this->input_cpu_;
-    inputs["gpu"] = std::isnan(this->input_gpu_) ? nullptr : this->input_gpu_;
-    inputs["other"] = std::isnan(this->input_other_) ? nullptr : this->input_other_;
-    inputs["newest_age_ms"] = newest_age == UINT32_MAX ? nullptr : newest_age;
+    if (std::isnan(this->input_cpu_)) {
+      inputs["cpu"] = nullptr;
+    } else {
+      inputs["cpu"] = this->input_cpu_;
+    }
+
+    if (std::isnan(this->input_gpu_)) {
+      inputs["gpu"] = nullptr;
+    } else {
+      inputs["gpu"] = this->input_gpu_;
+    }
+
+    if (std::isnan(this->input_other_)) {
+      inputs["other"] = nullptr;
+    } else {
+      inputs["other"] = this->input_other_;
+    }
+
+    if (newest_age == UINT32_MAX) {
+      inputs["newest_age_ms"] = nullptr;
+    } else {
+      inputs["newest_age_ms"] = newest_age;
+    }
 
     root["online"] = this->input_fresh_(this->last_cpu_update_ms_) || this->input_fresh_(this->last_gpu_update_ms_) ||
                       this->input_fresh_(this->last_other_update_ms_);
@@ -493,7 +512,11 @@ std::string PcFanController::build_status_json_() const {
       channel_json["source"] = source_to_string_(channel.source);
       channel_json["mode"] = mode_to_string_(channel.mode);
       channel_json["applied_pwm"] = channel.applied_pwm;
-      channel_json["source_temp"] = std::isnan(channel.source_temp) ? nullptr : channel.source_temp;
+      if (std::isnan(channel.source_temp)) {
+        channel_json["source_temp"] = nullptr;
+      } else {
+        channel_json["source_temp"] = channel.source_temp;
+      }
       channel_json["failsafe"] = channel.failsafe;
       channel_json["setup_ok"] = channel.setup_ok;
       channel_json["status"] = channel.status;
