@@ -126,11 +126,25 @@ void PcFanController::regulate_() {
 }
 
 void PcFanController::regulate_channel_(Channel &channel) {
+  auto publish_entities = [&]() {
+    if (channel.temperature_sensor != nullptr) {
+      channel.temperature_sensor->publish_state(channel.source_temp);
+    }
+    if (channel.pwm_sensor != nullptr) {
+      channel.pwm_sensor->publish_state(channel.applied_pwm);
+    }
+    if (channel.status_text_sensor != nullptr) {
+      channel.status_text_sensor->publish_state(channel.status);
+    }
+  };
+
   if (!channel.setup_ok) {
     channel.applied_pwm = 0.0f;
     channel.failsafe = true;
     channel.last_temp = NAN;
     copy_string_(channel.status, sizeof(channel.status), "LEDC setup failed");
+    channel.source_temp = NAN;
+    publish_entities();
     return;
   }
 
@@ -140,6 +154,7 @@ void PcFanController::regulate_channel_(Channel &channel) {
     channel.last_temp = NAN;
     this->set_channel_pwm_(channel, 0.0f);
     copy_string_(channel.status, sizeof(channel.status), "OFF");
+    publish_entities();
     return;
   }
 
@@ -150,6 +165,7 @@ void PcFanController::regulate_channel_(Channel &channel) {
     const float pwm = clamp_(channel.manual_pwm, 0.0f, 100.0f);
     this->set_channel_pwm_(channel, pwm);
     snprintf(channel.status, sizeof(channel.status), "MANUAL %.0f %%", pwm);
+    publish_entities();
     return;
   }
 
@@ -167,6 +183,7 @@ void PcFanController::regulate_channel_(Channel &channel) {
                               : clamp_(channel.failsafe_pwm, 0.0f, 100.0f);
     this->set_channel_pwm_(channel, pwm);
     snprintf(channel.status, sizeof(channel.status), "%s %.0f %%", missing ? "DEFAULT" : "FAILSAFE", pwm);
+    publish_entities();
     return;
   }
 
@@ -179,6 +196,7 @@ void PcFanController::regulate_channel_(Channel &channel) {
 
   snprintf(channel.status, sizeof(channel.status), "AUTO %s %.1f C -> %.0f %%", source_to_string_(channel.source),
            temperature, pwm);
+  publish_entities();
 }
 
 void PcFanController::set_channel_pwm_(Channel &channel, float pwm) {
@@ -428,6 +446,37 @@ void PcFanController::set_temperature_(InputSource source, float value) {
   } else if (source == InputSource::OTHER) {
     this->input_other_ = value;
     this->last_other_update_ms_ = now;
+  }
+}
+
+void PcFanController::set_temperature(const char *source, float value) {
+  const InputSource input_source = source_from_string_(source);
+  if (input_source == InputSource::MAX) {
+    return;
+  }
+
+  this->set_temperature_(input_source, value);
+  this->regulate_();
+}
+
+void PcFanController::set_channel_temperature_sensor(uint8_t channel_id, sensor::Sensor *sensor) {
+  Channel *channel = this->channel_by_id_(channel_id);
+  if (channel != nullptr) {
+    channel->temperature_sensor = sensor;
+  }
+}
+
+void PcFanController::set_channel_pwm_sensor(uint8_t channel_id, sensor::Sensor *sensor) {
+  Channel *channel = this->channel_by_id_(channel_id);
+  if (channel != nullptr) {
+    channel->pwm_sensor = sensor;
+  }
+}
+
+void PcFanController::set_channel_status_text_sensor(uint8_t channel_id, text_sensor::TextSensor *sensor) {
+  Channel *channel = this->channel_by_id_(channel_id);
+  if (channel != nullptr) {
+    channel->status_text_sensor = sensor;
   }
 }
 

@@ -1,9 +1,22 @@
 import json
 
 import esphome.codegen as cg
+from esphome import automation
 from esphome import pins
+from esphome.components import sensor, text_sensor
 import esphome.config_validation as cv
-from esphome.const import CONF_ID, CONF_NAME, CONF_PIN, CONF_UPDATE_INTERVAL
+from esphome.const import (
+    CONF_ID,
+    CONF_NAME,
+    CONF_PIN,
+    CONF_UPDATE_INTERVAL,
+    ENTITY_CATEGORY_DIAGNOSTIC,
+    ICON_PERCENT,
+    ICON_THERMOMETER,
+    STATE_CLASS_MEASUREMENT,
+    UNIT_CELSIUS,
+    UNIT_PERCENT,
+)
 
 CODEOWNERS = ["@custom"]
 AUTO_LOAD = ["json", "web_server_base"]
@@ -26,9 +39,18 @@ CONF_PWM_FREQUENCY = "pwm_frequency"
 CONF_SOURCE = "source"
 CONF_TEMP = "temp"
 CONF_UI_PATH = "ui_path"
+CONF_VALUE = "value"
+CONF_TEMPERATURE_SENSOR = "temperature_sensor"
+CONF_PWM_SENSOR = "pwm_sensor"
+CONF_STATUS_TEXT_SENSOR = "status_text_sensor"
 
 pc_fan_controller_ns = cg.esphome_ns.namespace("pc_fan_controller")
 PcFanController = pc_fan_controller_ns.class_("PcFanController", cg.Component)
+SetTemperatureAction = pc_fan_controller_ns.class_(
+    "SetTemperatureAction", automation.Action.template()
+)
+
+_PC_FAN_CONTROLLER_INSTANCES = []
 
 PWM_PERCENT = cv.All(cv.float_, cv.Range(min=0.0, max=100.0))
 TEMP_VALUE = cv.All(cv.float_, cv.Range(min=-40.0, max=150.0))
@@ -73,6 +95,24 @@ CHANNEL_SCHEMA = cv.Schema(
         ): cv.All(
             cv.ensure_list(CURVE_POINT_SCHEMA),
             cv.Length(min=2, max=8),
+        ),
+        cv.Optional(CONF_TEMPERATURE_SENSOR): sensor.sensor_schema(
+            unit_of_measurement=UNIT_CELSIUS,
+            icon=ICON_THERMOMETER,
+            accuracy_decimals=1,
+            state_class=STATE_CLASS_MEASUREMENT,
+            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+        ),
+        cv.Optional(CONF_PWM_SENSOR): sensor.sensor_schema(
+            unit_of_measurement=UNIT_PERCENT,
+            icon=ICON_PERCENT,
+            accuracy_decimals=0,
+            state_class=STATE_CLASS_MEASUREMENT,
+            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+        ),
+        cv.Optional(CONF_STATUS_TEXT_SENSOR): text_sensor.text_sensor_schema(
+            icon="mdi:fan",
+            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
         ),
     }
 )
@@ -132,6 +172,7 @@ async def to_code(config):
 
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
+    _PC_FAN_CONTROLLER_INSTANCES.append(var)
 
     cg.add(var.set_update_interval_ms(config[CONF_UPDATE_INTERVAL].total_milliseconds))
     cg.add(var.set_data_timeout_ms(config[CONF_DATA_TIMEOUT].total_milliseconds))
@@ -139,7 +180,7 @@ async def to_code(config):
     cg.add(var.set_ui_path(config[CONF_UI_PATH]))
     cg.add(var.set_api_path(config[CONF_API_PATH]))
 
-    for channel in channels:
+    for index, channel in enumerate(channels, start=1):
         pin = await cg.gpio_pin_expression(channel[CONF_PIN])
         curve_json = json.dumps(channel[CONF_CURVE], separators=(",", ":"))
 
@@ -159,3 +200,46 @@ async def to_code(config):
                 curve_json,
             )
         )
+
+        if CONF_TEMPERATURE_SENSOR in channel:
+            sens = await sensor.new_sensor(channel[CONF_TEMPERATURE_SENSOR])
+            cg.add(var.set_channel_temperature_sensor(index, sens))
+
+        if CONF_PWM_SENSOR in channel:
+            sens = await sensor.new_sensor(channel[CONF_PWM_SENSOR])
+            cg.add(var.set_channel_pwm_sensor(index, sens))
+
+        if CONF_STATUS_TEXT_SENSOR in channel:
+            sens = await text_sensor.new_text_sensor(channel[CONF_STATUS_TEXT_SENSOR])
+            cg.add(var.set_channel_status_text_sensor(index, sens))
+
+
+@automation.register_action(
+    "pc_fan_controller.set_temperature",
+    SetTemperatureAction,
+    schema=cv.Schema(
+        {
+            cv.Optional(CONF_ID): cv.use_id(PcFanController),
+            cv.Required(CONF_SOURCE): cv.one_of("cpu", "gpu", "other", lower=True),
+            cv.Required(CONF_VALUE): cv.templatable(cv.float_),
+        }
+    ),
+    synchronous=True,
+)
+async def pc_fan_controller_set_temperature_action_to_code(
+    config, action_id, template_arg, args
+):
+    if CONF_ID in config:
+        paren = await cg.get_variable(config[CONF_ID])
+    else:
+        if len(_PC_FAN_CONTROLLER_INSTANCES) != 1:
+            raise cv.Invalid(
+                "pc_fan_controller.set_temperature requires id when multiple controllers are defined"
+            )
+        paren = _PC_FAN_CONTROLLER_INSTANCES[0]
+
+    var = cg.new_Pvariable(action_id, template_arg, paren)
+    cg.add(var.set_source(config[CONF_SOURCE]))
+    template_ = await cg.templatable(config[CONF_VALUE], args, float)
+    cg.add(var.set_value(template_))
+    return var

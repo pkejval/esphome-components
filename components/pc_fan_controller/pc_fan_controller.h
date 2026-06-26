@@ -8,6 +8,9 @@
 #include "esphome/core/gpio.h"
 #include "esphome/core/preferences.h"
 
+#include "esphome/components/sensor/sensor.h"
+#include "esphome/components/text_sensor/text_sensor.h"
+
 #include "esphome/components/json/json_util.h"
 #include "esphome/components/web_server_base/web_server_base.h"
 
@@ -33,6 +36,10 @@ class PcFanController : public Component, public AsyncWebHandler {
   void set_pwm_frequency(uint32_t pwm_frequency) { this->pwm_frequency_ = pwm_frequency; }
   void set_ui_path(const std::string &ui_path) { this->ui_path_ = ui_path; }
   void set_api_path(const std::string &api_path) { this->api_path_ = api_path; }
+  void set_temperature(const char *source, float value);
+  void set_channel_temperature_sensor(uint8_t channel_id, sensor::Sensor *sensor);
+  void set_channel_pwm_sensor(uint8_t channel_id, sensor::Sensor *sensor);
+  void set_channel_status_text_sensor(uint8_t channel_id, text_sensor::TextSensor *sensor);
 
   void add_channel(InternalGPIOPin *pin, const char *name, uint8_t ledc_channel, bool inverted, const char *source,
                    float min_pwm, float max_pwm, float default_pwm, float failsafe_pwm, float manual_pwm, float hysteresis,
@@ -89,6 +96,9 @@ class PcFanController : public Component, public AsyncWebHandler {
     float applied_pwm{0.0f};
     float source_temp{NAN};
     float last_temp{NAN};
+    sensor::Sensor *temperature_sensor{nullptr};
+    sensor::Sensor *pwm_sensor{nullptr};
+    text_sensor::TextSensor *status_text_sensor{nullptr};
     bool setup_ok{false};
     bool failsafe{true};
     char status[80]{};
@@ -191,3 +201,5 @@ class PcFanController : public Component, public AsyncWebHandler {
 };
 
 }  // namespace esphome::pc_fan_controller
+
+#include "automation.h"
