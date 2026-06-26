@@ -19,7 +19,7 @@ from esphome.const import (
 )
 
 CODEOWNERS = ["@custom"]
-AUTO_LOAD = ["json", "web_server_base"]
+AUTO_LOAD = ["json", "web_server_base", "sensor", "text_sensor"]
 DEPENDENCIES = ["esp32", "network"]
 
 CONF_API_PATH = "api_path"
