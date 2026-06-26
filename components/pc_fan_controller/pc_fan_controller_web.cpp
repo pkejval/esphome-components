@@ -102,7 +102,13 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
     overflow: hidden;
     touch-action: none;
   }
-  .curve-graph svg { width: 100%; height: 100%; display: block; }
+  .curve-graph svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+    shape-rendering: geometricPrecision;
+    text-rendering: geometricPrecision;
+  }
   .graph-add {
     position: absolute;
     top: 10px;
@@ -119,13 +125,13 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   .curve-point.is-hovered circle:last-child { fill: #facc15; }
   .curve-point.is-hovered .curve-halo { fill: rgba(250, 204, 21, 0.24); }
   .curve-point.is-endpoint circle:last-child { fill: #60a5fa; }
-  .curve-segment { stroke: transparent; stroke-width: 4.5; pointer-events: stroke; cursor: crosshair; }
+  .curve-segment { stroke: transparent; stroke-width: 2.2; pointer-events: stroke; cursor: crosshair; vector-effect: non-scaling-stroke; }
   .curve-segment.is-hovered { stroke: rgba(250, 204, 21, 0.9); }
   .curve-label { fill: var(--muted); font-size: 3px; }
-  .curve-grid-minor { stroke: var(--border); stroke-width: 0.22; opacity: 0.18; }
-  .curve-grid-major { stroke: var(--border); stroke-width: 0.4; opacity: 0.45; }
-  .curve-axis { stroke: var(--muted); stroke-width: 0.65; opacity: 0.9; }
-  .curve-line { stroke: var(--accent); stroke-width: 1.6; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+  .curve-grid-minor { stroke: var(--border); stroke-width: 0.22; opacity: 0.18; vector-effect: non-scaling-stroke; shape-rendering: crispEdges; }
+  .curve-grid-major { stroke: var(--border); stroke-width: 0.4; opacity: 0.45; vector-effect: non-scaling-stroke; shape-rendering: crispEdges; }
+  .curve-axis { stroke: var(--muted); stroke-width: 0.65; opacity: 0.9; vector-effect: non-scaling-stroke; shape-rendering: crispEdges; }
+  .curve-line { stroke: var(--accent); stroke-width: 1.6; fill: none; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
   .curve-halo { fill: rgba(56, 189, 248, 0.18); }
   .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
   .status-line { margin-top: 10px; color: var(--muted); }
@@ -278,7 +284,8 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
       const a = curveToSvgPoint(channel.curve[i]);
       const b = curveToSvgPoint(channel.curve[i + 1]);
       const projected = projectPointOnSegment(x, y, a.x, a.y, b.x, b.y);
-      if (nearestSegment === null || projected.d2 < nearestSegment.d2) {
+      const nearEndpoint = projected.t < 0.18 || projected.t > 0.82;
+      if (!nearEndpoint && (nearestSegment === null || projected.d2 < nearestSegment.d2)) {
         nearestSegment = { kind: "segment", index: i, ...projected };
       }
     }
