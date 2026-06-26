@@ -153,6 +153,8 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   let activeIndex = 0;
   let curveDrag = null;
   let curveHover = null;
+  const GRAPH_WIDTH = 200;
+  const GRAPH_HEIGHT = 100;
 
   const tabs = document.getElementById("tabs");
   const editor = document.getElementById("channelEditor");
@@ -225,23 +227,23 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
 
   function curveToSvgPoint(point) {
     return {
-      x: clamp(point.temp, 0, 100),
-      y: clamp(100 - point.pwm, 0, 100)
+      x: clamp(point.temp * 2, 0, GRAPH_WIDTH),
+      y: clamp(GRAPH_HEIGHT - point.pwm, 0, GRAPH_HEIGHT)
     };
   }
 
   function svgToCurvePoint(x, y) {
     return {
-      temp: roundInt(clamp(x, 0, 100)),
-      pwm: roundInt(clamp(100 - y, 0, 100))
+      temp: roundInt(clamp(x / 2, 0, 100)),
+      pwm: roundInt(clamp(GRAPH_HEIGHT - y, 0, GRAPH_HEIGHT))
     };
   }
 
   function getSvgPoint(svg, event) {
     const rect = svg.getBoundingClientRect();
     return {
-      x: clamp(((event.clientX - rect.left) / rect.width) * 100, 0, 100),
-      y: clamp(((event.clientY - rect.top) / rect.height) * 100, 0, 100)
+      x: clamp(((event.clientX - rect.left) / rect.width) * GRAPH_WIDTH, 0, GRAPH_WIDTH),
+      y: clamp(((event.clientY - rect.top) / rect.height) * GRAPH_HEIGHT, 0, GRAPH_HEIGHT)
     };
   }
 
@@ -498,15 +500,15 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
     for (let i = 0; i <= 20; i++) {
       const tick = i * 5;
       const cls = i % 5 === 0 ? "curve-grid-major" : "curve-grid-minor";
-      grid.push(`<line class="${cls}" x1="${tick}" y1="0" x2="${tick}" y2="100"></line>`);
-      grid.push(`<line class="${cls}" x1="0" y1="${tick}" x2="100" y2="${tick}"></line>`);
+      grid.push(`<line class="${cls}" x1="${tick * 2}" y1="0" x2="${tick * 2}" y2="${GRAPH_HEIGHT}"></line>`);
+      grid.push(`<line class="${cls}" x1="0" y1="${tick}" x2="${GRAPH_WIDTH}" y2="${tick}"></line>`);
     }
 
     const axisLabels = [];
     for (let i = 0; i <= 5; i++) {
       const value = i * 20;
-      axisLabels.push(`<text class="curve-label" x="${value}" y="98" text-anchor="middle">${value}</text>`);
-      axisLabels.push(`<text class="curve-label" x="2" y="${100 - value + 1}" text-anchor="start">${value}</text>`);
+      axisLabels.push(`<text class="curve-label" x="${value * 2}" y="98" text-anchor="middle">${value}</text>`);
+      axisLabels.push(`<text class="curve-label" x="2" y="${GRAPH_HEIGHT - value + 1}" text-anchor="start">${value}</text>`);
     }
 
     const segments = points.slice(0, -1).map((point, index) => {
@@ -517,11 +519,11 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
 
     container.innerHTML = `
       <button type="button" id="addGraphPoint" class="graph-add">+ bod</button>
-      <svg id="curveGraphSvg" viewBox="0 0 100 100" preserveAspectRatio="none" aria-label="PWM curve graph">
-        <rect x="0" y="0" width="100" height="100" fill="transparent"></rect>
+      <svg id="curveGraphSvg" viewBox="0 0 ${GRAPH_WIDTH} ${GRAPH_HEIGHT}" preserveAspectRatio="none" aria-label="PWM curve graph">
+        <rect x="0" y="0" width="${GRAPH_WIDTH}" height="${GRAPH_HEIGHT}" fill="transparent"></rect>
         ${grid.join("")}
-        <line class="curve-axis" x1="0" y1="100" x2="100" y2="100"></line>
-        <line class="curve-axis" x1="0" y1="0" x2="0" y2="100"></line>
+        <line class="curve-axis" x1="0" y1="${GRAPH_HEIGHT}" x2="${GRAPH_WIDTH}" y2="${GRAPH_HEIGHT}"></line>
+        <line class="curve-axis" x1="0" y1="0" x2="0" y2="${GRAPH_HEIGHT}"></line>
         <path class="curve-line" d="${path}" data-role="curve-path"></path>
         ${segments}
         ${points.map((point, index) => `
