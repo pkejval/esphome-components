@@ -27,7 +27,6 @@ CONF_CHANNELS = "channels"
 CONF_CURVE = "curve"
 CONF_DEFAULT_PWM = "default_pwm"
 CONF_DATA_TIMEOUT = "data_timeout"
-CONF_FAILSAFE_PWM = "failsafe_pwm"
 CONF_HYSTERESIS = "hysteresis"
 CONF_INVERTED = "inverted"
 CONF_LEDC_CHANNEL = "ledc_channel"
@@ -78,7 +77,6 @@ CHANNEL_SCHEMA = cv.Schema(
         cv.Optional(CONF_MIN_PWM, default=25.0): PWM_PERCENT,
         cv.Optional(CONF_MAX_PWM, default=100.0): PWM_PERCENT,
         cv.Optional(CONF_DEFAULT_PWM, default=50.0): PWM_PERCENT,
-        cv.Optional(CONF_FAILSAFE_PWM, default=100.0): PWM_PERCENT,
         cv.Optional(CONF_MANUAL_PWM, default=50.0): PWM_PERCENT,
         cv.Optional(CONF_HYSTERESIS, default=3.0): cv.All(
             cv.float_,
@@ -194,7 +192,6 @@ async def to_code(config):
                 channel[CONF_MIN_PWM],
                 channel[CONF_MAX_PWM],
                 channel[CONF_DEFAULT_PWM],
-                channel[CONF_FAILSAFE_PWM],
                 channel[CONF_MANUAL_PWM],
                 channel[CONF_HYSTERESIS],
                 curve_json,

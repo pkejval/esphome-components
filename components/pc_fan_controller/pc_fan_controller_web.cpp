@@ -94,7 +94,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   .curve-graph {
     position: relative;
     width: 100%;
-    height: 320px;
+    height: 420px;
     margin-top: 12px;
     border: 1px solid var(--border);
     border-radius: 16px;
@@ -127,11 +127,11 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   .curve-point.is-endpoint circle:last-child { fill: #60a5fa; }
   .curve-segment { stroke: transparent; stroke-width: 2.2; pointer-events: stroke; cursor: crosshair; vector-effect: non-scaling-stroke; }
   .curve-segment.is-hovered { stroke: rgba(250, 204, 21, 0.9); }
-  .curve-label { fill: var(--muted); font-size: 3px; }
+  .curve-label { fill: var(--muted); font-size: 4.5px; }
   .curve-grid-minor { stroke: var(--border); stroke-width: 0.22; opacity: 0.18; vector-effect: non-scaling-stroke; shape-rendering: crispEdges; }
   .curve-grid-major { stroke: var(--border); stroke-width: 0.4; opacity: 0.45; vector-effect: non-scaling-stroke; shape-rendering: crispEdges; }
   .curve-axis { stroke: var(--muted); stroke-width: 0.65; opacity: 0.9; vector-effect: non-scaling-stroke; shape-rendering: crispEdges; }
-  .curve-line { stroke: var(--accent); stroke-width: 1.35; fill: none; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+  .curve-line { stroke: var(--accent); stroke-width: 1.8; fill: none; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
   .curve-halo { fill: rgba(56, 189, 248, 0.14); }
   .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
   .status-line { margin-top: 10px; color: var(--muted); }
@@ -153,9 +153,9 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   let activeIndex = 0;
   let curveDrag = null;
   let curveHover = null;
-  const GRAPH_WIDTH = 400;
-  const GRAPH_HEIGHT = 180;
-  const GRAPH_MARGIN = { left: 20, right: 12, top: 12, bottom: 24 };
+  const GRAPH_WIDTH = 560;
+  const GRAPH_HEIGHT = 260;
+  const GRAPH_MARGIN = { left: 28, right: 18, top: 16, bottom: 34 };
 
   const tabs = document.getElementById("tabs");
   const editor = document.getElementById("channelEditor");
@@ -346,7 +346,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   function updateStatusWidgets() {
     const connection = document.getElementById("connectionStatus");
     if (connection !== null) {
-      connection.textContent = status.online ? "ONLINE" : "FAILSAFE";
+      connection.textContent = status.online ? "ONLINE" : "OFFLINE";
       connection.className = status.online ? "status ok" : "status danger";
     }
 
@@ -423,7 +423,6 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
           <label>Min PWM % <input id="minPwm" type="number" min="0" max="100" step="1" value="${channel.min_pwm}"></label>
           <label>Max PWM % <input id="maxPwm" type="number" min="0" max="100" step="1" value="${channel.max_pwm}"></label>
           <label>Výchozí PWM % <input id="defaultPwm" type="number" min="0" max="100" step="1" value="${channel.default_pwm}"></label>
-          <label>Failsafe PWM % <input id="failsafePwm" type="number" min="0" max="100" step="1" value="${channel.failsafe_pwm}"></label>
           <label>Manual PWM % <input id="manualPwm" type="number" min="0" max="100" step="1" value="${channel.manual_pwm}"></label>
           <label>Hystereze °C <input id="hysteresis" type="number" min="0" max="20" step="0.5" value="${channel.hysteresis}"></label>
           <label>Invertovaný výstup
@@ -462,7 +461,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
     document.getElementById("channelSource").value = channel.source;
     document.getElementById("inverted").value = String(channel.inverted);
 
-    ["channelName", "channelMode", "channelSource", "minPwm", "maxPwm", "defaultPwm", "failsafePwm", "manualPwm", "hysteresis", "inverted"]
+    ["channelName", "channelMode", "channelSource", "minPwm", "maxPwm", "defaultPwm", "manualPwm", "hysteresis", "inverted"]
       .forEach((id) => document.getElementById(id).addEventListener("input", updateChannelFromForm));
 
     document.getElementById("addPoint").addEventListener("click", () => {
@@ -539,8 +538,8 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
         ${segments}
         ${points.map((point, index) => `
           <g class="curve-point ${curveHover?.kind === "point" && curveHover.index === index ? "is-hovered" : ""} ${curveHover?.kind === "segment" && (curveHover.index === index || curveHover.index + 1 === index) ? "is-endpoint" : ""}" data-index="${index}">
-            <circle class="curve-halo" cx="${point.x}" cy="${point.y}" r="2.8"></circle>
-            <circle fill="var(--accent)" cx="${point.x}" cy="${point.y}" r="1.2"></circle>
+            <circle class="curve-halo" cx="${point.x}" cy="${point.y}" r="4.2"></circle>
+            <circle fill="var(--accent)" cx="${point.x}" cy="${point.y}" r="1.8"></circle>
           </g>
         `).join("")}
         ${axisLabels.join("")}
@@ -678,7 +677,6 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
     channel.min_pwm = clamp(Number(document.getElementById("minPwm").value), 0, 100);
     channel.max_pwm = clamp(Number(document.getElementById("maxPwm").value), 0, 100);
     channel.default_pwm = clamp(Number(document.getElementById("defaultPwm").value), 0, 100);
-    channel.failsafe_pwm = clamp(Number(document.getElementById("failsafePwm").value), 0, 100);
     channel.manual_pwm = clamp(Number(document.getElementById("manualPwm").value), 0, 100);
     channel.hysteresis = clamp(Number(document.getElementById("hysteresis").value), 0, 20);
     channel.inverted = document.getElementById("inverted").value === "true";
@@ -795,7 +793,6 @@ std::string PcFanController::build_config_json_() const {
       channel_json["min_pwm"] = channel.min_pwm;
       channel_json["max_pwm"] = channel.max_pwm;
       channel_json["default_pwm"] = channel.default_pwm;
-      channel_json["failsafe_pwm"] = channel.failsafe_pwm;
       channel_json["manual_pwm"] = channel.manual_pwm;
       channel_json["hysteresis"] = channel.hysteresis;
 
@@ -920,10 +917,6 @@ bool PcFanController::apply_config_json_(const std::string &data) {
 
         if (channel_json["default_pwm"].is<float>()) {
           channel->default_pwm = clamp_(channel_json["default_pwm"].as<float>(), 0.0f, 100.0f);
-        }
-
-        if (channel_json["failsafe_pwm"].is<float>()) {
-          channel->failsafe_pwm = clamp_(channel_json["failsafe_pwm"].as<float>(), 0.0f, 100.0f);
         }
 
         if (channel_json["manual_pwm"].is<float>()) {

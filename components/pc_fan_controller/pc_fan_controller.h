@@ -43,7 +43,7 @@ class PcFanController : public Component, public AsyncWebHandler {
   void set_channel_status_text_sensor(uint8_t channel_id, text_sensor::TextSensor *sensor);
 
   void add_channel(InternalGPIOPin *pin, const char *name, uint8_t ledc_channel, bool inverted, const char *source,
-                   float min_pwm, float max_pwm, float default_pwm, float failsafe_pwm, float manual_pwm, float hysteresis,
+                   float min_pwm, float max_pwm, float default_pwm, float manual_pwm, float hysteresis,
                    const char *curve_json);
 
   bool canHandle(AsyncWebServerRequest *request) const override;
@@ -53,7 +53,7 @@ class PcFanController : public Component, public AsyncWebHandler {
  protected:
   static constexpr uint8_t MAX_CURVE_POINTS = 8;
   static constexpr uint32_t PREFERENCE_MAGIC = 0x50434643;
-  static constexpr uint32_t PREFERENCE_VERSION = 2;
+  static constexpr uint32_t PREFERENCE_VERSION = 3;
   static constexpr uint32_t PWM_DUTY_MAX = 1023;
 
   enum class InputSource : uint8_t {
@@ -91,7 +91,6 @@ class PcFanController : public Component, public AsyncWebHandler {
     float min_pwm{25.0f};
     float max_pwm{100.0f};
     float default_pwm{50.0f};
-    float failsafe_pwm{100.0f};
     float manual_pwm{50.0f};
     float hysteresis{3.0f};
     float applied_pwm{0.0f};
@@ -120,7 +119,6 @@ class PcFanController : public Component, public AsyncWebHandler {
     float min_pwm;
     float max_pwm;
     float default_pwm;
-    float failsafe_pwm;
     float manual_pwm;
     float hysteresis;
     uint8_t curve_count;

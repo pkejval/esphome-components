@@ -53,7 +53,7 @@ float PcFanController::get_setup_priority() const { return setup_priority::WIFI 
 
 void PcFanController::add_channel(InternalGPIOPin *pin, const char *name, uint8_t ledc_channel, bool inverted,
                                   const char *source, float min_pwm, float max_pwm, float default_pwm,
-                                  float failsafe_pwm, float manual_pwm, float hysteresis, const char *curve_json) {
+                                  float manual_pwm, float hysteresis, const char *curve_json) {
   if (this->channel_count_ >= this->channels_.size()) {
     ESP_LOGW(TAG, "Maximum channel count reached, ignoring channel %s", name);
     return;
@@ -69,7 +69,6 @@ void PcFanController::add_channel(InternalGPIOPin *pin, const char *name, uint8_
   channel.min_pwm = clamp_(min_pwm, 0.0f, 100.0f);
   channel.max_pwm = clamp_(max_pwm, channel.min_pwm, 100.0f);
   channel.default_pwm = clamp_(default_pwm, 0.0f, 100.0f);
-  channel.failsafe_pwm = clamp_(failsafe_pwm, 0.0f, 100.0f);
   channel.manual_pwm = clamp_(manual_pwm, 0.0f, 100.0f);
   channel.hysteresis = clamp_(hysteresis, 0.0f, 20.0f);
   copy_string_(channel.name, sizeof(channel.name), name);
@@ -176,13 +175,11 @@ void PcFanController::regulate_channel_(Channel &channel) {
     channel.source_temp = NAN;
     channel.last_temp = NAN;
 
-    const bool missing = temperature_state == TemperatureState::MISSING;
-    channel.failsafe = !missing;
+    channel.failsafe = true;
 
-    const float pwm = missing ? clamp_(channel.default_pwm, 0.0f, 100.0f)
-                              : clamp_(channel.failsafe_pwm, 0.0f, 100.0f);
+    const float pwm = clamp_(channel.default_pwm, 0.0f, 100.0f);
     this->set_channel_pwm_(channel, pwm);
-    snprintf(channel.status, sizeof(channel.status), "%s %.0f %%", missing ? "DEFAULT" : "FAILSAFE", pwm);
+    snprintf(channel.status, sizeof(channel.status), "DEFAULT %.0f %%", pwm);
     publish_entities();
     return;
   }
@@ -313,7 +310,7 @@ uint32_t PcFanController::newest_input_age_ms_() const {
 
 float PcFanController::curve_pwm_(Channel &channel, float temperature) const {
   if (channel.curve_count == 0) {
-    return channel.failsafe_pwm;
+    return channel.default_pwm;
   }
 
   float effective_temperature = temperature;
@@ -491,7 +488,6 @@ void PcFanController::save_config_() {
     stored_channel.min_pwm = channel.min_pwm;
     stored_channel.max_pwm = channel.max_pwm;
     stored_channel.default_pwm = channel.default_pwm;
-    stored_channel.failsafe_pwm = channel.failsafe_pwm;
     stored_channel.manual_pwm = channel.manual_pwm;
     stored_channel.hysteresis = channel.hysteresis;
     stored_channel.curve_count = channel.curve_count;
@@ -537,7 +533,6 @@ void PcFanController::load_config_() {
     channel.min_pwm = clamp_(stored_channel.min_pwm, 0.0f, 100.0f);
     channel.max_pwm = clamp_(stored_channel.max_pwm, channel.min_pwm, 100.0f);
     channel.default_pwm = clamp_(stored_channel.default_pwm, 0.0f, 100.0f);
-    channel.failsafe_pwm = clamp_(stored_channel.failsafe_pwm, 0.0f, 100.0f);
     channel.manual_pwm = clamp_(stored_channel.manual_pwm, 0.0f, 100.0f);
     channel.hysteresis = clamp_(stored_channel.hysteresis, 0.0f, 20.0f);
     channel.curve_count = std::min<uint8_t>(stored_channel.curve_count, MAX_CURVE_POINTS);
