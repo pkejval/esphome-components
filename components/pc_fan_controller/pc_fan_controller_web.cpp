@@ -123,7 +123,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   .curve-point { cursor: grab; }
   .curve-point:active { cursor: grabbing; }
   .curve-point.is-hovered circle:last-child { fill: #facc15; }
-  .curve-point.is-hovered .curve-halo { fill: rgba(250, 204, 21, 0.24); }
+  .curve-point.is-hovered .curve-halo { fill: rgba(250, 204, 21, 0.18); }
   .curve-point.is-endpoint circle:last-child { fill: #60a5fa; }
   .curve-segment { stroke: transparent; stroke-width: 2.2; pointer-events: stroke; cursor: crosshair; vector-effect: non-scaling-stroke; }
   .curve-segment.is-hovered { stroke: rgba(250, 204, 21, 0.9); }
@@ -131,8 +131,8 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   .curve-grid-minor { stroke: var(--border); stroke-width: 0.22; opacity: 0.18; vector-effect: non-scaling-stroke; shape-rendering: crispEdges; }
   .curve-grid-major { stroke: var(--border); stroke-width: 0.4; opacity: 0.45; vector-effect: non-scaling-stroke; shape-rendering: crispEdges; }
   .curve-axis { stroke: var(--muted); stroke-width: 0.65; opacity: 0.9; vector-effect: non-scaling-stroke; shape-rendering: crispEdges; }
-  .curve-line { stroke: var(--accent); stroke-width: 1.6; fill: none; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
-  .curve-halo { fill: rgba(56, 189, 248, 0.18); }
+  .curve-line { stroke: var(--accent); stroke-width: 1.35; fill: none; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+  .curve-halo { fill: rgba(56, 189, 248, 0.14); }
   .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
   .status-line { margin-top: 10px; color: var(--muted); }
   .ok { color: var(--ok); }
@@ -153,8 +153,9 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   let activeIndex = 0;
   let curveDrag = null;
   let curveHover = null;
-  const GRAPH_WIDTH = 200;
-  const GRAPH_HEIGHT = 100;
+  const GRAPH_WIDTH = 400;
+  const GRAPH_HEIGHT = 180;
+  const GRAPH_MARGIN = { left: 20, right: 12, top: 12, bottom: 24 };
 
   const tabs = document.getElementById("tabs");
   const editor = document.getElementById("channelEditor");
@@ -226,16 +227,20 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   }
 
   function curveToSvgPoint(point) {
+    const plotWidth = GRAPH_WIDTH - GRAPH_MARGIN.left - GRAPH_MARGIN.right;
+    const plotHeight = GRAPH_HEIGHT - GRAPH_MARGIN.top - GRAPH_MARGIN.bottom;
     return {
-      x: clamp(point.temp * 2, 0, GRAPH_WIDTH),
-      y: clamp(GRAPH_HEIGHT - point.pwm, 0, GRAPH_HEIGHT)
+      x: GRAPH_MARGIN.left + clamp(point.temp, 0, 100) * plotWidth / 100,
+      y: GRAPH_MARGIN.top + clamp(100 - point.pwm, 0, 100) * plotHeight / 100
     };
   }
 
   function svgToCurvePoint(x, y) {
+    const plotWidth = GRAPH_WIDTH - GRAPH_MARGIN.left - GRAPH_MARGIN.right;
+    const plotHeight = GRAPH_HEIGHT - GRAPH_MARGIN.top - GRAPH_MARGIN.bottom;
     return {
-      temp: roundInt(clamp(x / 2, 0, 100)),
-      pwm: roundInt(clamp(GRAPH_HEIGHT - y, 0, GRAPH_HEIGHT))
+      temp: roundInt(clamp((x - GRAPH_MARGIN.left) * 100 / plotWidth, 0, 100)),
+      pwm: roundInt(clamp((GRAPH_HEIGHT - GRAPH_MARGIN.bottom - y) * 100 / plotHeight, 0, 100))
     };
   }
 
@@ -269,7 +274,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   }
 
   function hitTestCurve(channel, x, y) {
-    const pointThreshold2 = 7.5 * 7.5;
+    const pointThreshold2 = 10 * 10;
     const segmentThreshold2 = 1.5 * 1.5;
     let nearestPoint = null;
     let nearestSegment = null;
@@ -496,19 +501,25 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
       ? `M ${points.map((point) => `${point.x},${point.y}`).join(" L ")}`
       : "";
 
+    const plotWidth = GRAPH_WIDTH - GRAPH_MARGIN.left - GRAPH_MARGIN.right;
+    const plotHeight = GRAPH_HEIGHT - GRAPH_MARGIN.top - GRAPH_MARGIN.bottom;
+
     const grid = [];
-    for (let i = 0; i <= 20; i++) {
-      const tick = i * 5;
-      const cls = i % 5 === 0 ? "curve-grid-major" : "curve-grid-minor";
-      grid.push(`<line class="${cls}" x1="${tick * 2}" y1="0" x2="${tick * 2}" y2="${GRAPH_HEIGHT}"></line>`);
-      grid.push(`<line class="${cls}" x1="0" y1="${tick}" x2="${GRAPH_WIDTH}" y2="${tick}"></line>`);
+    for (let i = 0; i <= 100; i++) {
+      const x = GRAPH_MARGIN.left + (i * plotWidth / 100);
+      const y = GRAPH_MARGIN.top + (i * plotHeight / 100);
+      const cls = i % 10 === 0 ? "curve-grid-major" : "curve-grid-minor";
+      grid.push(`<line class="${cls}" x1="${x}" y1="${GRAPH_MARGIN.top}" x2="${x}" y2="${GRAPH_HEIGHT - GRAPH_MARGIN.bottom}"></line>`);
+      grid.push(`<line class="${cls}" x1="${GRAPH_MARGIN.left}" y1="${y}" x2="${GRAPH_WIDTH - GRAPH_MARGIN.right}" y2="${y}"></line>`);
     }
 
     const axisLabels = [];
-    for (let i = 0; i <= 5; i++) {
-      const value = i * 20;
-      axisLabels.push(`<text class="curve-label" x="${value * 2}" y="98" text-anchor="middle">${value}</text>`);
-      axisLabels.push(`<text class="curve-label" x="2" y="${GRAPH_HEIGHT - value + 1}" text-anchor="start">${value}</text>`);
+    for (let i = 0; i <= 10; i++) {
+      const value = i * 10;
+      const x = GRAPH_MARGIN.left + (value * plotWidth / 100);
+      const y = GRAPH_MARGIN.top + ((100 - value) * plotHeight / 100);
+      axisLabels.push(`<text class="curve-label" x="${x}" y="${GRAPH_HEIGHT - 6}" text-anchor="middle">${value}</text>`);
+      axisLabels.push(`<text class="curve-label" x="4" y="${y + 2}" text-anchor="start">${value}</text>`);
     }
 
     const segments = points.slice(0, -1).map((point, index) => {
@@ -522,8 +533,8 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
       <svg id="curveGraphSvg" viewBox="0 0 ${GRAPH_WIDTH} ${GRAPH_HEIGHT}" preserveAspectRatio="none" aria-label="PWM curve graph">
         <rect x="0" y="0" width="${GRAPH_WIDTH}" height="${GRAPH_HEIGHT}" fill="transparent"></rect>
         ${grid.join("")}
-        <line class="curve-axis" x1="0" y1="${GRAPH_HEIGHT}" x2="${GRAPH_WIDTH}" y2="${GRAPH_HEIGHT}"></line>
-        <line class="curve-axis" x1="0" y1="0" x2="0" y2="${GRAPH_HEIGHT}"></line>
+        <line class="curve-axis" x1="${GRAPH_MARGIN.left}" y1="${GRAPH_HEIGHT - GRAPH_MARGIN.bottom}" x2="${GRAPH_WIDTH - GRAPH_MARGIN.right}" y2="${GRAPH_HEIGHT - GRAPH_MARGIN.bottom}"></line>
+        <line class="curve-axis" x1="${GRAPH_MARGIN.left}" y1="${GRAPH_MARGIN.top}" x2="${GRAPH_MARGIN.left}" y2="${GRAPH_HEIGHT - GRAPH_MARGIN.bottom}"></line>
         <path class="curve-line" d="${path}" data-role="curve-path"></path>
         ${segments}
         ${points.map((point, index) => `
