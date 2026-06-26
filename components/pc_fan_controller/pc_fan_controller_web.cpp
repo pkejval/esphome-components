@@ -863,6 +863,10 @@ std::string PcFanController::build_status_json_() const {
 
 bool PcFanController::apply_config_json_(const std::string &data) {
   bool ok = false;
+  auto is_number = [](auto value) {
+    return value.template is<float>() || value.template is<int>() || value.template is<long>() ||
+           value.template is<unsigned long>();
+  };
 
   JsonDocument doc = json::parse_json(data);
   if (!doc.is<JsonObject>()) {
@@ -907,23 +911,23 @@ bool PcFanController::apply_config_json_(const std::string &data) {
           channel->inverted = channel_json["inverted"].as<bool>();
         }
 
-        if (channel_json["min_pwm"].is<float>()) {
+        if (is_number(channel_json["min_pwm"])) {
           channel->min_pwm = clamp_(channel_json["min_pwm"].as<float>(), 0.0f, 100.0f);
         }
 
-        if (channel_json["max_pwm"].is<float>()) {
+        if (is_number(channel_json["max_pwm"])) {
           channel->max_pwm = clamp_(channel_json["max_pwm"].as<float>(), channel->min_pwm, 100.0f);
         }
 
-        if (channel_json["default_pwm"].is<float>()) {
+        if (is_number(channel_json["default_pwm"])) {
           channel->default_pwm = clamp_(channel_json["default_pwm"].as<float>(), 0.0f, 100.0f);
         }
 
-        if (channel_json["manual_pwm"].is<float>()) {
+        if (is_number(channel_json["manual_pwm"])) {
           channel->manual_pwm = clamp_(channel_json["manual_pwm"].as<float>(), 0.0f, 100.0f);
         }
 
-        if (channel_json["hysteresis"].is<float>()) {
+        if (is_number(channel_json["hysteresis"])) {
           channel->hysteresis = clamp_(channel_json["hysteresis"].as<float>(), 0.0f, 20.0f);
         }
 
@@ -946,6 +950,10 @@ bool PcFanController::apply_config_json_(const std::string &data) {
 
 bool PcFanController::apply_temperature_json_(const std::string &data) {
   bool ok = false;
+  auto is_number = [](auto value) {
+    return value.template is<float>() || value.template is<int>() || value.template is<long>() ||
+           value.template is<unsigned long>();
+  };
 
   JsonDocument doc = json::parse_json(data);
   if (!doc.is<JsonObject>()) {
@@ -955,17 +963,17 @@ bool PcFanController::apply_temperature_json_(const std::string &data) {
   JsonObject root = doc.as<JsonObject>();
 
   {
-    if (root["cpu"].is<float>()) {
+    if (is_number(root["cpu"])) {
       this->set_temperature_(InputSource::CPU, root["cpu"].as<float>());
       ok = true;
     }
 
-    if (root["gpu"].is<float>()) {
+    if (is_number(root["gpu"])) {
       this->set_temperature_(InputSource::GPU, root["gpu"].as<float>());
       ok = true;
     }
 
-    if (root["other"].is<float>()) {
+    if (is_number(root["other"])) {
       this->set_temperature_(InputSource::OTHER, root["other"].as<float>());
       ok = true;
     }
@@ -989,14 +997,17 @@ void PcFanController::handle_api_config_(AsyncWebServerRequest *request) {
     return;
   }
 
-  if (!request->hasArg("json")) {
+  std::string body;
+  if (request->hasArg("plain")) {
+    body = request->arg("plain");
+  } else if (request->hasArg("json")) {
+    body = request->arg("json");
+  } else {
     request->send(409, "application/json", "{\"error\":\"missing json form field\"}");
     return;
   }
 
-  const std::string data = request->arg("json");
-
-  if (!this->apply_config_json_(data)) {
+  if (!this->apply_config_json_(body)) {
     request->send(409, "application/json", "{\"error\":\"invalid config json\"}");
     return;
   }
@@ -1012,8 +1023,9 @@ void PcFanController::handle_api_status_(AsyncWebServerRequest *request) {
 void PcFanController::handle_api_temperature_(AsyncWebServerRequest *request) {
   bool ok = false;
 
-  if (request->hasArg("json")) {
-    ok = this->apply_temperature_json_(request->arg("json"));
+  if (request->hasArg("plain") || request->hasArg("json")) {
+    const std::string body = request->hasArg("plain") ? request->arg("plain") : request->arg("json");
+    ok = this->apply_temperature_json_(body);
   } else {
     float value = NAN;
 

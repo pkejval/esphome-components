@@ -368,13 +368,17 @@ void PcFanController::set_default_curve_(Channel &channel) {
 
 bool PcFanController::apply_curve_json_(Channel &channel, JsonArray curve) {
   uint8_t count = 0;
+  auto is_number = [](auto value) {
+    return value.template is<float>() || value.template is<int>() || value.template is<long>() ||
+           value.template is<unsigned long>();
+  };
 
   for (JsonObject point : curve) {
     if (count >= MAX_CURVE_POINTS) {
       break;
     }
 
-    if (!point["temp"].is<float>() || !point["pwm"].is<float>()) {
+    if (!is_number(point["temp"]) || !is_number(point["pwm"])) {
       continue;
     }
 
