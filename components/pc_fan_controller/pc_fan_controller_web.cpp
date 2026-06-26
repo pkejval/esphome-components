@@ -474,10 +474,10 @@ std::string PcFanController::build_status_json_() const {
     const uint32_t newest_age = this->newest_input_age_ms_();
 
     JsonObject inputs = root["inputs"].to<JsonObject>();
-    inputs["cpu"] = std::isnan(this->input_cpu_) ? nullptr : JsonVariant(this->input_cpu_);
-    inputs["gpu"] = std::isnan(this->input_gpu_) ? nullptr : JsonVariant(this->input_gpu_);
-    inputs["other"] = std::isnan(this->input_other_) ? nullptr : JsonVariant(this->input_other_);
-    inputs["newest_age_ms"] = newest_age == UINT32_MAX ? nullptr : JsonVariant(newest_age);
+    inputs["cpu"] = std::isnan(this->input_cpu_) ? nullptr : this->input_cpu_;
+    inputs["gpu"] = std::isnan(this->input_gpu_) ? nullptr : this->input_gpu_;
+    inputs["other"] = std::isnan(this->input_other_) ? nullptr : this->input_other_;
+    inputs["newest_age_ms"] = newest_age == UINT32_MAX ? nullptr : newest_age;
 
     root["online"] = this->input_fresh_(this->last_cpu_update_ms_) || this->input_fresh_(this->last_gpu_update_ms_) ||
                       this->input_fresh_(this->last_other_update_ms_);
@@ -493,7 +493,7 @@ std::string PcFanController::build_status_json_() const {
       channel_json["source"] = source_to_string_(channel.source);
       channel_json["mode"] = mode_to_string_(channel.mode);
       channel_json["applied_pwm"] = channel.applied_pwm;
-      channel_json["source_temp"] = std::isnan(channel.source_temp) ? nullptr : JsonVariant(channel.source_temp);
+      channel_json["source_temp"] = std::isnan(channel.source_temp) ? nullptr : channel.source_temp;
       channel_json["failsafe"] = channel.failsafe;
       channel_json["setup_ok"] = channel.setup_ok;
       channel_json["status"] = channel.status;
@@ -504,7 +504,14 @@ std::string PcFanController::build_status_json_() const {
 bool PcFanController::apply_config_json_(const std::string &data) {
   bool ok = false;
 
-  json::parse_json(data, [&](JsonObject root) {
+  JsonDocument doc = json::parse_json(data);
+  if (!doc.is<JsonObject>()) {
+    return false;
+  }
+
+  JsonObject root = doc.as<JsonObject>();
+
+  {
     if (root["data_timeout_ms"].is<uint32_t>()) {
       this->data_timeout_ms_ = root["data_timeout_ms"].as<uint32_t>();
     }
@@ -571,7 +578,7 @@ bool PcFanController::apply_config_json_(const std::string &data) {
     }
 
     ok = true;
-  });
+  }
 
   if (ok) {
     this->save_config_();
@@ -584,7 +591,14 @@ bool PcFanController::apply_config_json_(const std::string &data) {
 bool PcFanController::apply_temperature_json_(const std::string &data) {
   bool ok = false;
 
-  json::parse_json(data, [&](JsonObject root) {
+  JsonDocument doc = json::parse_json(data);
+  if (!doc.is<JsonObject>()) {
+    return false;
+  }
+
+  JsonObject root = doc.as<JsonObject>();
+
+  {
     if (root["cpu"].is<float>()) {
       this->set_temperature_(InputSource::CPU, root["cpu"].as<float>());
       ok = true;
@@ -599,7 +613,7 @@ bool PcFanController::apply_temperature_json_(const std::string &data) {
       this->set_temperature_(InputSource::OTHER, root["other"].as<float>());
       ok = true;
     }
-  });
+  }
 
   if (ok) {
     this->regulate_();

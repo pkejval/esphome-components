@@ -396,21 +396,13 @@ bool PcFanController::apply_curve_json_(Channel &channel, JsonArray curve) {
 }
 
 bool PcFanController::parse_curve_json_(Channel &channel, const std::string &curve_json) {
-  bool ok = false;
-
-  json::parse_json(curve_json, [&](JsonObject root) {
-    if (root["curve"].is<JsonArray>()) {
-      ok = this->apply_curve_json_(channel, root["curve"].as<JsonArray>());
-    }
-  });
-
-  if (ok) {
-    return true;
-  }
-
   JsonDocument doc = json::parse_json(curve_json);
   if (doc.is<JsonArray>()) {
     return this->apply_curve_json_(channel, doc.as<JsonArray>());
+  }
+
+  if (doc.is<JsonObject>() && doc.as<JsonObject>()["curve"].is<JsonArray>()) {
+    return this->apply_curve_json_(channel, doc.as<JsonObject>()["curve"].as<JsonArray>());
   }
 
   return false;
