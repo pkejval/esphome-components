@@ -7,7 +7,6 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   <header class="topbar">
     <div>
       <h1>PC Fan Controller</h1>
-      <p>ESP32 nadstavba pro PWM ventilátory s regulací podle CPU, GPU a Other teplot.</p>
     </div>
     <div class="status" id="connectionStatus">Načítám...</div>
   </header>
@@ -19,18 +18,18 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
     <article><span>Data age</span><strong id="dataAge">--</strong></article>
   </section>
 
-  <section class="panel">
-    <h2>Poslat teploty</h2>
+  <nav id="tabs" class="tabs"></nav>
+  <main id="channelEditor"></main>
+
+  <details class="panel send-temps">
+    <summary>Poslat teploty</summary>
     <div class="grid3">
       <label>CPU °C <input id="manualCpu" type="number" min="-40" max="150" step="0.1" value="50"></label>
       <label>GPU °C <input id="manualGpu" type="number" min="-40" max="150" step="0.1" value="45"></label>
       <label>Other °C <input id="manualOther" type="number" min="-40" max="150" step="0.1" value="40"></label>
     </div>
     <button type="button" id="sendTemps" class="primary">Odeslat</button>
-  </section>
-
-  <nav id="tabs" class="tabs"></nav>
-  <main id="channelEditor"></main>
+  </details>
 </section>
 
 <style>
@@ -74,6 +73,12 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   .cards span { color: var(--muted); display: block; font-size: 14px; margin-bottom: 5px; }
   .cards strong { font-size: 24px; }
   .panel { margin-bottom: 16px; }
+  .send-temps summary { cursor: pointer; font-weight: 600; list-style: none; }
+  .send-temps summary::-webkit-details-marker { display: none; }
+  .send-temps summary::before { content: ">"; display: inline-block; margin-right: 8px; color: var(--muted); transition: transform 0.15s ease; }
+  .send-temps[open] summary::before { transform: rotate(90deg); }
+  .send-temps > .grid3 { margin-top: 12px; }
+  .send-temps > button { margin-top: 12px; }
   .grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
   .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
   label { display: block; color: var(--muted); font-size: 14px; }
@@ -86,6 +91,42 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   .curve-table { width: 100%; border-collapse: collapse; margin-top: 12px; }
   .curve-table th, .curve-table td { border-bottom: 1px solid var(--border); padding: 8px; text-align: left; }
   .curve-table th { color: var(--muted); font-weight: 500; }
+  .curve-graph {
+    position: relative;
+    width: 100%;
+    height: 320px;
+    margin-top: 12px;
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    background: linear-gradient(180deg, rgba(56, 189, 248, 0.04), transparent), var(--panel2);
+    overflow: hidden;
+    touch-action: none;
+  }
+  .curve-graph svg { width: 100%; height: 100%; display: block; }
+  .graph-add {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    z-index: 2;
+    padding: 6px 10px;
+    border-radius: 999px;
+    background: rgba(17, 24, 39, 0.78);
+    backdrop-filter: blur(8px);
+  }
+  .graph-add:hover { border-color: var(--accent); }
+  .curve-point { cursor: grab; }
+  .curve-point:active { cursor: grabbing; }
+  .curve-point.is-hovered circle:last-child { fill: #facc15; }
+  .curve-point.is-hovered .curve-halo { fill: rgba(250, 204, 21, 0.24); }
+  .curve-point.is-endpoint circle:last-child { fill: #60a5fa; }
+  .curve-segment { stroke: transparent; stroke-width: 4.5; pointer-events: stroke; cursor: crosshair; }
+  .curve-segment.is-hovered { stroke: rgba(250, 204, 21, 0.9); }
+  .curve-label { fill: var(--muted); font-size: 3px; }
+  .curve-grid-minor { stroke: var(--border); stroke-width: 0.22; opacity: 0.18; }
+  .curve-grid-major { stroke: var(--border); stroke-width: 0.4; opacity: 0.45; }
+  .curve-axis { stroke: var(--muted); stroke-width: 0.65; opacity: 0.9; }
+  .curve-line { stroke: var(--accent); stroke-width: 1.6; fill: none; }
+  .curve-halo { fill: rgba(56, 189, 248, 0.18); }
   .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
   .status-line { margin-top: 10px; color: var(--muted); }
   .ok { color: var(--ok); }
@@ -104,6 +145,8 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   let config = null;
   let status = null;
   let activeIndex = 0;
+  let curveDrag = null;
+  let curveHover = null;
 
   const tabs = document.getElementById("tabs");
   const editor = document.getElementById("channelEditor");
@@ -161,13 +204,114 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
       if (channel.curve[i].temp <= channel.curve[i - 1].temp) {
         channel.curve[i].temp = channel.curve[i - 1].temp + 1;
       }
-      channel.curve[i].temp = clamp(channel.curve[i].temp, 20, 100);
+      channel.curve[i].temp = clamp(channel.curve[i].temp, 0, 100);
       channel.curve[i].pwm = clamp(channel.curve[i].pwm, 0, 100);
     }
     if (channel.curve.length > 0) {
-      channel.curve[0].temp = clamp(channel.curve[0].temp, 20, 100);
+      channel.curve[0].temp = clamp(channel.curve[0].temp, 0, 100);
       channel.curve[0].pwm = clamp(channel.curve[0].pwm, 0, 100);
     }
+  }
+
+  function curveToSvgPoint(point) {
+    return {
+      x: clamp(point.temp, 0, 100),
+      y: clamp(100 - point.pwm, 0, 100)
+    };
+  }
+
+  function svgToCurvePoint(x, y) {
+    return {
+      temp: clamp(x, 0, 100),
+      pwm: clamp(100 - y, 0, 100)
+    };
+  }
+
+  function getSvgPoint(svg, event) {
+    const rect = svg.getBoundingClientRect();
+    return {
+      x: clamp(((event.clientX - rect.left) / rect.width) * 100, 0, 100),
+      y: clamp(((event.clientY - rect.top) / rect.height) * 100, 0, 100)
+    };
+  }
+
+  function dist2(ax, ay, bx, by) {
+    const dx = ax - bx;
+    const dy = ay - by;
+    return dx * dx + dy * dy;
+  }
+
+  function projectPointOnSegment(px, py, ax, ay, bx, by) {
+    const abx = bx - ax;
+    const aby = by - ay;
+    const length2 = abx * abx + aby * aby;
+
+    if (length2 <= 0.0001) {
+      return { x: ax, y: ay, t: 0, d2: dist2(px, py, ax, ay) };
+    }
+
+    const t = clamp(((px - ax) * abx + (py - ay) * aby) / length2, 0, 1);
+    const x = ax + t * abx;
+    const y = ay + t * aby;
+    return { x, y, t, d2: dist2(px, py, x, y) };
+  }
+
+  function hitTestCurve(channel, x, y) {
+    const pointThreshold2 = 4.5 * 4.5;
+    const segmentThreshold2 = 2.5 * 2.5;
+    let nearestPoint = null;
+    let nearestSegment = null;
+
+    channel.curve.forEach((point, index) => {
+      const svgPoint = curveToSvgPoint(point);
+      const d2 = dist2(x, y, svgPoint.x, svgPoint.y);
+      if (nearestPoint === null || d2 < nearestPoint.d2) {
+        nearestPoint = { kind: "point", index, d2 };
+      }
+    });
+
+    for (let i = 0; i < channel.curve.length - 1; i++) {
+      const a = curveToSvgPoint(channel.curve[i]);
+      const b = curveToSvgPoint(channel.curve[i + 1]);
+      const projected = projectPointOnSegment(x, y, a.x, a.y, b.x, b.y);
+      if (nearestSegment === null || projected.d2 < nearestSegment.d2) {
+        nearestSegment = { kind: "segment", index: i, ...projected };
+      }
+    }
+
+    const pointHit = nearestPoint !== null && nearestPoint.d2 <= pointThreshold2 ? nearestPoint : null;
+    const segmentHit = nearestSegment !== null && nearestSegment.d2 <= segmentThreshold2 ? nearestSegment : null;
+
+    if (pointHit !== null && (segmentHit === null || pointHit.d2 <= segmentHit.d2)) {
+      return pointHit;
+    }
+
+    return segmentHit;
+  }
+
+  function insertPointOnSegment(channel, segmentIndex, point) {
+    channel.curve.splice(segmentIndex + 1, 0, svgToCurvePoint(point.x, point.y));
+    normalizeCurve(channel);
+    return segmentIndex + 1;
+  }
+
+  function addGraphPoint(channel) {
+    if (channel.curve.length < 2) return null;
+
+    let segmentIndex = 0;
+    let longestSpan = -1;
+
+    for (let i = 0; i < channel.curve.length - 1; i++) {
+      const span = channel.curve[i + 1].temp - channel.curve[i].temp;
+      if (span > longestSpan) {
+        longestSpan = span;
+        segmentIndex = i;
+      }
+    }
+
+    const a = curveToSvgPoint(channel.curve[segmentIndex]);
+    const b = curveToSvgPoint(channel.curve[segmentIndex + 1]);
+    return insertPointOnSegment(channel, segmentIndex, { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
   }
 
   async function loadConfig() {
@@ -178,14 +322,41 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
 
   async function loadStatus() {
     status = await apiGet("/status");
+    updateStatusWidgets();
+  }
+
+  function updateStatusWidgets() {
     const connection = document.getElementById("connectionStatus");
-    connection.textContent = status.online ? "ONLINE" : "FAILSAFE";
-    connection.className = status.online ? "status ok" : "status danger";
-    document.getElementById("cpuTemp").textContent = tempText(status.inputs.cpu);
-    document.getElementById("gpuTemp").textContent = tempText(status.inputs.gpu);
-    document.getElementById("otherTemp").textContent = tempText(status.inputs.other);
-    document.getElementById("dataAge").textContent = msText(status.inputs.newest_age_ms);
-    renderEditor();
+    if (connection !== null) {
+      connection.textContent = status.online ? "ONLINE" : "FAILSAFE";
+      connection.className = status.online ? "status ok" : "status danger";
+    }
+
+    const cpuTemp = document.getElementById("cpuTemp");
+    if (cpuTemp !== null) cpuTemp.textContent = tempText(status.inputs.cpu);
+
+    const gpuTemp = document.getElementById("gpuTemp");
+    if (gpuTemp !== null) gpuTemp.textContent = tempText(status.inputs.gpu);
+
+    const otherTemp = document.getElementById("otherTemp");
+    if (otherTemp !== null) otherTemp.textContent = tempText(status.inputs.other);
+
+    const dataAge = document.getElementById("dataAge");
+    if (dataAge !== null) dataAge.textContent = msText(status.inputs.newest_age_ms);
+
+    const channel = config?.channels?.[activeIndex];
+    if (channel !== undefined) {
+      const channelStatus = status?.channels?.find((item) => item.id === channel.id);
+
+      const statusText = document.getElementById("channelStatusText");
+      if (statusText !== null) statusText.textContent = channelStatus?.status ?? "--";
+
+      const appliedPwm = document.getElementById("channelAppliedPwm");
+      if (appliedPwm !== null) appliedPwm.textContent = pwmText(channelStatus?.applied_pwm);
+
+      const sourceTemp = document.getElementById("channelSourceTemp");
+      if (sourceTemp !== null) sourceTemp.textContent = tempText(channelStatus?.source_temp);
+    }
   }
 
   function renderTabs() {
@@ -246,10 +417,12 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
         </div>
 
         <p class="status-line">
-          Stav: <strong>${escapeHtml(channelStatus?.status ?? "--")}</strong>,
-          aktuální PWM: <strong>${pwmText(channelStatus?.applied_pwm)}</strong>,
-          zdrojová teplota: <strong>${tempText(channelStatus?.source_temp)}</strong>
+          Stav: <strong id="channelStatusText">${escapeHtml(channelStatus?.status ?? "--")}</strong>,
+          aktuální PWM: <strong id="channelAppliedPwm">${pwmText(channelStatus?.applied_pwm)}</strong>,
+          zdrojová teplota: <strong id="channelSourceTemp">${tempText(channelStatus?.source_temp)}</strong>
         </p>
+
+        <div class="curve-graph" id="curveGraph"></div>
 
         <table class="curve-table">
           <thead>
@@ -297,8 +470,150 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
 
     document.getElementById("reloadConfig").addEventListener("click", loadConfig);
 
+    renderCurveGraph(channel);
     renderCurveTable(channel);
   }
+
+  function renderCurveGraph(channel) {
+    const container = document.getElementById("curveGraph");
+    if (container === null) return;
+
+    const points = channel.curve.map(curveToSvgPoint);
+    const path = points.length > 0
+      ? `M ${points.map((point) => `${point.x},${point.y}`).join(" L ")}`
+      : "";
+
+    const grid = [];
+    for (let i = 0; i <= 20; i++) {
+      const tick = i * 5;
+      const cls = i % 5 === 0 ? "curve-grid-major" : "curve-grid-minor";
+      grid.push(`<line class="${cls}" x1="${tick}" y1="0" x2="${tick}" y2="100"></line>`);
+      grid.push(`<line class="${cls}" x1="0" y1="${tick}" x2="100" y2="${tick}"></line>`);
+    }
+
+    const axisLabels = [];
+    for (let i = 0; i <= 5; i++) {
+      const value = i * 20;
+      axisLabels.push(`<text class="curve-label" x="${value}" y="98" text-anchor="middle">${value}</text>`);
+      axisLabels.push(`<text class="curve-label" x="2" y="${100 - value + 1}" text-anchor="start">${value}</text>`);
+    }
+
+    const segments = points.slice(0, -1).map((point, index) => {
+      const next = points[index + 1];
+      const hovered = curveHover?.kind === "segment" && curveHover.index === index ? "is-hovered" : "";
+      return `<line class="curve-segment ${hovered}" data-segment="${index}" x1="${point.x}" y1="${point.y}" x2="${next.x}" y2="${next.y}"></line>`;
+    }).join("");
+
+    container.innerHTML = `
+      <button type="button" id="addGraphPoint" class="graph-add">+ bod</button>
+      <svg id="curveGraphSvg" viewBox="0 0 100 100" preserveAspectRatio="none" aria-label="PWM curve graph">
+        <rect x="0" y="0" width="100" height="100" fill="transparent"></rect>
+        ${grid.join("")}
+        <line class="curve-axis" x1="0" y1="100" x2="100" y2="100"></line>
+        <line class="curve-axis" x1="0" y1="0" x2="0" y2="100"></line>
+        <path class="curve-line" d="${path}" data-role="curve-path"></path>
+        ${segments}
+        ${points.map((point, index) => `
+          <g class="curve-point ${curveHover?.kind === "point" && curveHover.index === index ? "is-hovered" : ""} ${curveHover?.kind === "segment" && (curveHover.index === index || curveHover.index + 1 === index) ? "is-endpoint" : ""}" data-index="${index}">
+            <circle class="curve-halo" cx="${point.x}" cy="${point.y}" r="2.8"></circle>
+            <circle fill="var(--accent)" cx="${point.x}" cy="${point.y}" r="1.2"></circle>
+          </g>
+        `).join("")}
+        ${axisLabels.join("")}
+      </svg>
+    `;
+
+    const addButton = document.getElementById("addGraphPoint");
+    if (addButton !== null) {
+      addButton.addEventListener("click", () => {
+        const insertedIndex = addGraphPoint(channel);
+        if (insertedIndex !== null) {
+          curveHover = { kind: "point", index: insertedIndex };
+          renderCurveGraph(channel);
+          renderCurveTable(channel);
+        }
+      });
+    }
+
+    const svg = document.getElementById("curveGraphSvg");
+    if (svg === null) return;
+
+    svg.addEventListener("pointermove", (event) => {
+      if (curveDrag !== null) return;
+      const point = getSvgPoint(svg, event);
+      curveHover = hitTestCurve(channel, point.x, point.y);
+      renderCurveGraph(channel);
+    });
+
+    svg.addEventListener("pointerleave", () => {
+      if (curveDrag !== null) return;
+      curveHover = null;
+      renderCurveGraph(channel);
+    });
+
+    svg.addEventListener("pointerdown", (event) => {
+      const point = getSvgPoint(svg, event);
+      const hit = hitTestCurve(channel, point.x, point.y);
+      if (hit === null) return;
+
+      event.preventDefault();
+
+      if (hit.kind === "point") {
+        curveDrag = { index: hit.index, pointerId: event.pointerId };
+        curveHover = hit;
+        svg.setPointerCapture(event.pointerId);
+        return;
+      }
+
+      if (hit.kind === "segment") {
+        const insertedIndex = insertPointOnSegment(channel, hit.index, point);
+        curveDrag = { index: insertedIndex, pointerId: event.pointerId };
+        curveHover = { kind: "point", index: insertedIndex };
+        renderCurveGraph(channel);
+        renderCurveTable(channel);
+        svg.setPointerCapture(event.pointerId);
+      }
+    });
+  }
+
+  function updateCurveFromPointer(event) {
+    if (curveDrag === null) return;
+
+    const channel = config?.channels?.[activeIndex];
+    if (channel === undefined || !channel.curve[curveDrag.index]) return;
+
+    const svg = document.getElementById("curveGraphSvg");
+    if (svg === null) return;
+
+    const point = getSvgPoint(svg, event);
+    const x = point.x;
+    const y = point.y;
+
+    channel.curve[curveDrag.index] = svgToCurvePoint(x, y);
+    renderCurveGraph(channel);
+    renderCurveTable(channel);
+  }
+
+  window.addEventListener("pointermove", (event) => {
+    if (curveDrag === null) return;
+    updateCurveFromPointer(event);
+  });
+
+  window.addEventListener("pointerup", () => {
+    if (curveDrag !== null) {
+      const channel = config?.channels?.[activeIndex];
+      if (channel !== undefined) {
+        normalizeCurve(channel);
+        renderCurveGraph(channel);
+        renderCurveTable(channel);
+      }
+    }
+    curveDrag = null;
+  });
+
+  window.addEventListener("pointercancel", () => {
+    curveDrag = null;
+  });
 
   function renderCurveTable(channel) {
     const tbody = document.getElementById("curveRows");
@@ -309,7 +624,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
       const row = document.createElement("tr");
       row.innerHTML = `
         <td>${index + 1}</td>
-        <td><input type="number" min="20" max="100" step="1" value="${point.temp}" data-kind="temp" data-index="${index}"></td>
+        <td><input type="number" min="0" max="100" step="1" value="${point.temp}" data-kind="temp" data-index="${index}"></td>
         <td><input type="number" min="0" max="100" step="1" value="${point.pwm}" data-kind="pwm" data-index="${index}"></td>
       `;
       tbody.appendChild(row);
@@ -323,9 +638,10 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
         const value = Number(target.value);
 
         if (!Number.isFinite(value) || !channel.curve[index]) return;
-        channel.curve[index][kind] = kind === "temp" ? clamp(value, 20, 100) : clamp(value, 0, 100);
+        channel.curve[index][kind] = kind === "temp" ? clamp(value, 0, 100) : clamp(value, 0, 100);
         normalizeCurve(channel);
-        renderEditor();
+        renderCurveGraph(channel);
+        renderCurveTable(channel);
       });
     });
   }
