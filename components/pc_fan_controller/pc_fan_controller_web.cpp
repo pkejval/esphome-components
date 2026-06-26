@@ -125,7 +125,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   .curve-grid-minor { stroke: var(--border); stroke-width: 0.22; opacity: 0.18; }
   .curve-grid-major { stroke: var(--border); stroke-width: 0.4; opacity: 0.45; }
   .curve-axis { stroke: var(--muted); stroke-width: 0.65; opacity: 0.9; }
-  .curve-line { stroke: var(--accent); stroke-width: 1.6; fill: none; }
+  .curve-line { stroke: var(--accent); stroke-width: 1.6; fill: none; stroke-linecap: round; stroke-linejoin: round; }
   .curve-halo { fill: rgba(56, 189, 248, 0.18); }
   .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
   .status-line { margin-top: 10px; color: var(--muted); }
@@ -156,6 +156,10 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
     return Math.min(max, Math.max(min, value));
   }
 
+  function roundInt(value) {
+    return Math.round(value);
+  }
+
   function escapeHtml(value) {
     return String(value)
       .replaceAll("&", "&amp;")
@@ -166,7 +170,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
 
   function tempText(value) {
     if (value === null || value === undefined || Number.isNaN(value)) return "--";
-    return `${Number(value).toFixed(1)} °C`;
+    return `${roundInt(value)} °C`;
   }
 
   function pwmText(value) {
@@ -204,12 +208,12 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
       if (channel.curve[i].temp <= channel.curve[i - 1].temp) {
         channel.curve[i].temp = channel.curve[i - 1].temp + 1;
       }
-      channel.curve[i].temp = clamp(channel.curve[i].temp, 0, 100);
-      channel.curve[i].pwm = clamp(channel.curve[i].pwm, 0, 100);
+      channel.curve[i].temp = roundInt(clamp(channel.curve[i].temp, 0, 100));
+      channel.curve[i].pwm = roundInt(clamp(channel.curve[i].pwm, 0, 100));
     }
     if (channel.curve.length > 0) {
-      channel.curve[0].temp = clamp(channel.curve[0].temp, 0, 100);
-      channel.curve[0].pwm = clamp(channel.curve[0].pwm, 0, 100);
+      channel.curve[0].temp = roundInt(clamp(channel.curve[0].temp, 0, 100));
+      channel.curve[0].pwm = roundInt(clamp(channel.curve[0].pwm, 0, 100));
     }
   }
 
@@ -222,8 +226,8 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
 
   function svgToCurvePoint(x, y) {
     return {
-      temp: clamp(x, 0, 100),
-      pwm: clamp(100 - y, 0, 100)
+      temp: roundInt(clamp(x, 0, 100)),
+      pwm: roundInt(clamp(100 - y, 0, 100))
     };
   }
 
@@ -257,8 +261,8 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   }
 
   function hitTestCurve(channel, x, y) {
-    const pointThreshold2 = 4.5 * 4.5;
-    const segmentThreshold2 = 2.5 * 2.5;
+    const pointThreshold2 = 7.5 * 7.5;
+    const segmentThreshold2 = 1.5 * 1.5;
     let nearestPoint = null;
     let nearestSegment = null;
 
