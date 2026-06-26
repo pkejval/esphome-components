@@ -32,6 +32,7 @@ class PcFanController : public Component, public AsyncWebHandler {
   float get_setup_priority() const override;
 
   void set_update_interval_ms(uint32_t update_interval_ms) { this->update_interval_ms_ = update_interval_ms; }
+  void set_update_interval(uint32_t update_interval_ms) { this->set_update_interval_ms(update_interval_ms); }
   void set_data_timeout_ms(uint32_t data_timeout_ms) { this->data_timeout_ms_ = data_timeout_ms; }
   void set_pwm_frequency(uint32_t pwm_frequency) { this->pwm_frequency_ = pwm_frequency; }
   void set_ui_path(const std::string &ui_path) { this->ui_path_ = ui_path; }
