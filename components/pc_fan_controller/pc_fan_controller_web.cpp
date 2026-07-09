@@ -257,7 +257,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
       } catch (error) {
         console.error(error);
       }
-    }, 80);
+    }, 500);
   }
 
   function normalizeCurve(channel) {
