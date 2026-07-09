@@ -398,6 +398,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
 
     const channel = config.channels[activeIndex];
     const channelStatus = status?.channels?.find((item) => item.id === channel.id);
+    const manualOnly = channel.mode === "manual";
 
     editor.innerHTML = `
       <section class="panel">
@@ -412,7 +413,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
               <option value="off">Off</option>
             </select>
           </label>
-          <label>Zdroj teploty
+          <label style="${manualOnly ? "display:none;" : ""}">Zdroj teploty
             <select id="channelSource">
               <option value="cpu">CPU</option>
               <option value="gpu">GPU</option>
@@ -420,11 +421,11 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
               <option value="max">Max</option>
             </select>
           </label>
-          <label>Min PWM % <input id="minPwm" type="number" min="0" max="100" step="1" value="${channel.min_pwm}"></label>
-          <label>Max PWM % <input id="maxPwm" type="number" min="0" max="100" step="1" value="${channel.max_pwm}"></label>
-          <label>Výchozí PWM % <input id="defaultPwm" type="number" min="0" max="100" step="1" value="${channel.default_pwm}"></label>
+          <label style="${manualOnly ? "display:none;" : ""}">Min PWM % <input id="minPwm" type="number" min="0" max="100" step="1" value="${channel.min_pwm}"></label>
+          <label style="${manualOnly ? "display:none;" : ""}">Max PWM % <input id="maxPwm" type="number" min="0" max="100" step="1" value="${channel.max_pwm}"></label>
+          <label style="${manualOnly ? "display:none;" : ""}">Výchozí PWM % <input id="defaultPwm" type="number" min="0" max="100" step="1" value="${channel.default_pwm}"></label>
           <label>Manual PWM % <input id="manualPwm" type="number" min="0" max="100" step="1" value="${channel.manual_pwm}"></label>
-          <label>Hystereze °C <input id="hysteresis" type="number" min="0" max="20" step="0.5" value="${channel.hysteresis}"></label>
+          <label style="${manualOnly ? "display:none;" : ""}">Hystereze °C <input id="hysteresis" type="number" min="0" max="20" step="0.5" value="${channel.hysteresis}"></label>
           <label>Invertovaný výstup
             <select id="inverted">
               <option value="true">Ano</option>
@@ -435,13 +436,13 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
 
         <p class="status-line">
           Stav: <strong id="channelStatusText">${escapeHtml(channelStatus?.status ?? "--")}</strong>,
-          aktuální PWM: <strong id="channelAppliedPwm">${pwmText(channelStatus?.applied_pwm)}</strong>,
-          zdrojová teplota: <strong id="channelSourceTemp">${tempText(channelStatus?.source_temp)}</strong>
+          aktuální PWM: <strong id="channelAppliedPwm">${pwmText(channelStatus?.applied_pwm)}</strong>${manualOnly ? "" : `,
+          zdrojová teplota: <strong id="channelSourceTemp">${tempText(channelStatus?.source_temp)}</strong>`}
         </p>
 
-        <div class="curve-graph" id="curveGraph"></div>
+        <div class="curve-graph" id="curveGraph" style="${manualOnly ? "display:none;" : ""}"></div>
 
-        <table class="curve-table">
+        <table class="curve-table" style="${manualOnly ? "display:none;" : ""}">
           <thead>
             <tr><th>Bod</th><th>Teplota °C</th><th>PWM %</th></tr>
           </thead>
@@ -449,8 +450,8 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
         </table>
 
         <div class="actions">
-          <button type="button" id="addPoint">Přidat bod</button>
-          <button type="button" id="removePoint">Odebrat poslední bod</button>
+          <button type="button" id="addPoint" style="${manualOnly ? "display:none;" : ""}">Přidat bod</button>
+          <button type="button" id="removePoint" style="${manualOnly ? "display:none;" : ""}">Odebrat poslední bod</button>
           <button type="button" id="saveConfig" class="primary">Uložit do ESP</button>
           <button type="button" id="reloadConfig">Načíst z ESP</button>
         </div>
@@ -461,8 +462,13 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
     document.getElementById("channelSource").value = channel.source;
     document.getElementById("inverted").value = String(channel.inverted);
 
-    ["channelName", "channelMode", "channelSource", "minPwm", "maxPwm", "defaultPwm", "manualPwm", "hysteresis", "inverted"]
+    ["channelName", "channelSource", "minPwm", "maxPwm", "defaultPwm", "manualPwm", "hysteresis", "inverted"]
       .forEach((id) => document.getElementById(id).addEventListener("input", updateChannelFromForm));
+
+    document.getElementById("channelMode").addEventListener("change", (event) => {
+      updateChannelFromForm(event);
+      renderEditor();
+    });
 
     document.getElementById("addPoint").addEventListener("click", () => {
       if (channel.curve.length >= 8) return;
