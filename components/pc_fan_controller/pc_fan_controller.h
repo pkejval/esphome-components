@@ -37,6 +37,7 @@ class PcFanController : public Component, public AsyncWebHandler {
   void set_pwm_frequency(uint32_t pwm_frequency) { this->pwm_frequency_ = pwm_frequency; }
   void set_ui_path(const std::string &ui_path) { this->ui_path_ = ui_path; }
   void set_api_path(const std::string &api_path) { this->api_path_ = api_path; }
+  void set_ui_title(const std::string &ui_title) { this->ui_title_ = ui_title; }
   void set_temperature(const char *source, float value);
   void set_channel_temperature_sensor(uint8_t channel_id, sensor::Sensor *sensor);
   void set_channel_pwm_sensor(uint8_t channel_id, sensor::Sensor *sensor);
@@ -144,6 +145,7 @@ class PcFanController : public Component, public AsyncWebHandler {
 
   std::string ui_path_{"/fan-control"};
   std::string api_path_{"/fan-api"};
+  std::string ui_title_{"PC Fan Controller"};
 
   float input_cpu_{NAN};
   float input_gpu_{NAN};
@@ -175,7 +177,7 @@ class PcFanController : public Component, public AsyncWebHandler {
 
   void set_temperature_(InputSource source, float value);
 
-  bool apply_config_json_(const std::string &data);
+  bool apply_config_json_(const std::string &data, bool persist);
   bool apply_temperature_json_(const std::string &data);
   std::string build_config_json_() const;
   std::string build_status_json_() const;
@@ -185,6 +187,7 @@ class PcFanController : public Component, public AsyncWebHandler {
 
   void handle_ui_(AsyncWebServerRequest *request);
   void handle_api_config_(AsyncWebServerRequest *request);
+  void handle_api_apply_(AsyncWebServerRequest *request);
   void handle_api_status_(AsyncWebServerRequest *request);
   void handle_api_temperature_(AsyncWebServerRequest *request);
   void handle_api_channel_(AsyncWebServerRequest *request);

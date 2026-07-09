@@ -5,6 +5,7 @@ from esphome import automation
 from esphome import pins
 from esphome.components import sensor, text_sensor
 import esphome.config_validation as cv
+from esphome.core import CORE
 from esphome.const import (
     CONF_ID,
     CONF_NAME,
@@ -177,6 +178,9 @@ async def to_code(config):
     cg.add(var.set_pwm_frequency(config[CONF_PWM_FREQUENCY]))
     cg.add(var.set_ui_path(config[CONF_UI_PATH]))
     cg.add(var.set_api_path(config[CONF_API_PATH]))
+
+    ui_title = CORE.friendly_name or CORE.name
+    cg.add(var.set_ui_title(ui_title))
 
     for index, channel in enumerate(channels, start=1):
         pin = await cg.gpio_pin_expression(channel[CONF_PIN])

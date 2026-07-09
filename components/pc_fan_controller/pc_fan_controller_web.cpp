@@ -2,11 +2,35 @@
 
 namespace esphome::pc_fan_controller {
 
+static std::string html_escape(std::string value) {
+  size_t pos = 0;
+  while ((pos = value.find('&', pos)) != std::string::npos) {
+    value.replace(pos, 1, "&amp;");
+    pos += 5;
+  }
+  pos = 0;
+  while ((pos = value.find('<', pos)) != std::string::npos) {
+    value.replace(pos, 1, "&lt;");
+    pos += 4;
+  }
+  pos = 0;
+  while ((pos = value.find('>', pos)) != std::string::npos) {
+    value.replace(pos, 1, "&gt;");
+    pos += 4;
+  }
+  pos = 0;
+  while ((pos = value.find('"', pos)) != std::string::npos) {
+    value.replace(pos, 1, "&quot;");
+    pos += 6;
+  }
+  return value;
+}
+
 static const char FAN_CONTROL_HTML[] = R"HTML(
 <section class="wrap">
   <header class="topbar">
     <div>
-      <h1>PC Fan Controller</h1>
+      <h1 id="pageTitle">__TITLE__</h1>
     </div>
     <div class="status" id="connectionStatus">Načítám...</div>
   </header>
@@ -153,12 +177,15 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   let activeIndex = 0;
   let curveDrag = null;
   let curveHover = null;
+  let applyTimer = null;
   const GRAPH_WIDTH = 560;
   const GRAPH_HEIGHT = 260;
   const GRAPH_MARGIN = { left: 28, right: 18, top: 16, bottom: 34 };
 
   const tabs = document.getElementById("tabs");
   const editor = document.getElementById("channelEditor");
+
+  document.title = document.getElementById("pageTitle")?.textContent ?? "PC Fan Controller";
 
   function clamp(value, min, max) {
     if (!Number.isFinite(value)) return min;
@@ -209,6 +236,28 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
     });
     if (!response.ok) throw new Error(`POST ${path} failed`);
     return response;
+  }
+
+  async function applyDraft() {
+    if (!config) return;
+    updateChannelFromForm();
+    await apiPost("/apply", config);
+    await loadStatus();
+  }
+
+  function scheduleApply() {
+    if (applyTimer !== null) {
+      clearTimeout(applyTimer);
+    }
+
+    applyTimer = setTimeout(async () => {
+      applyTimer = null;
+      try {
+        await applyDraft();
+      } catch (error) {
+        console.error(error);
+      }
+    }, 80);
   }
 
   function normalizeCurve(channel) {
@@ -463,10 +512,11 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
     document.getElementById("inverted").value = String(channel.inverted);
 
     ["channelName", "channelSource", "minPwm", "maxPwm", "defaultPwm", "manualPwm", "hysteresis", "inverted"]
-      .forEach((id) => document.getElementById(id).addEventListener("input", updateChannelFromForm));
+      .forEach((id) => document.getElementById(id).addEventListener("input", scheduleApply));
 
     document.getElementById("channelMode").addEventListener("change", (event) => {
       updateChannelFromForm(event);
+      scheduleApply();
       renderEditor();
     });
 
@@ -475,12 +525,14 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
       const last = channel.curve[channel.curve.length - 1] ?? { temp: 35, pwm: 25 };
       channel.curve.push({ temp: Math.min(100, last.temp + 5), pwm: Math.min(100, last.pwm + 5) });
       normalizeCurve(channel);
+      scheduleApply();
       renderEditor();
     });
 
     document.getElementById("removePoint").addEventListener("click", () => {
       if (channel.curve.length <= 2) return;
       channel.curve.pop();
+      scheduleApply();
       renderEditor();
     });
 
@@ -635,6 +687,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
         normalizeCurve(channel);
         renderCurveGraph(channel);
         renderCurveTable(channel);
+        scheduleApply();
       }
     }
     curveDrag = null;
@@ -671,6 +724,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
         normalizeCurve(channel);
         renderCurveGraph(channel);
         renderCurveTable(channel);
+        scheduleApply();
       });
     });
   }
@@ -730,6 +784,10 @@ bool PcFanController::canHandle(AsyncWebServerRequest *request) const {
     return request->method() == HTTP_GET || request->method() == HTTP_POST;
   }
 
+  if (url == this->api_path_ + "/apply") {
+    return request->method() == HTTP_POST;
+  }
+
   if (url == this->api_path_ + "/status") {
     return request->method() == HTTP_GET;
   }
@@ -756,6 +814,11 @@ void PcFanController::handleRequest(AsyncWebServerRequest *request) {
 
   if (url == this->api_path_ + "/config") {
     this->handle_api_config_(request);
+    return;
+  }
+
+  if (url == this->api_path_ + "/apply") {
+    this->handle_api_apply_(request);
     return;
   }
 
@@ -867,7 +930,7 @@ std::string PcFanController::build_status_json_() const {
   });
 }
 
-bool PcFanController::apply_config_json_(const std::string &data) {
+bool PcFanController::apply_config_json_(const std::string &data, bool persist) {
   bool ok = false;
   auto is_number = [](auto value) {
     return value.template is<float>() || value.template is<int>() || value.template is<long>() ||
@@ -946,8 +1009,11 @@ bool PcFanController::apply_config_json_(const std::string &data) {
     ok = true;
   }
 
-  if (ok) {
+  if (ok && persist) {
     this->save_config_();
+  }
+
+  if (ok) {
     this->regulate_();
   }
 
@@ -993,7 +1059,16 @@ bool PcFanController::apply_temperature_json_(const std::string &data) {
 }
 
 void PcFanController::handle_ui_(AsyncWebServerRequest *request) {
-  request->send(200, "text/html; charset=utf-8", FAN_CONTROL_HTML);
+  std::string html = FAN_CONTROL_HTML;
+  const std::string title = html_escape(this->ui_title_);
+
+  size_t pos = 0;
+  while ((pos = html.find("__TITLE__", pos)) != std::string::npos) {
+    html.replace(pos, 9, title);
+    pos += title.length();
+  }
+
+  request->send(200, "text/html; charset=utf-8", html.c_str());
 }
 
 void PcFanController::handle_api_config_(AsyncWebServerRequest *request) {
@@ -1013,7 +1088,26 @@ void PcFanController::handle_api_config_(AsyncWebServerRequest *request) {
     return;
   }
 
-  if (!this->apply_config_json_(body)) {
+  if (!this->apply_config_json_(body, true)) {
+    request->send(409, "application/json", "{\"error\":\"invalid config json\"}");
+    return;
+  }
+
+  request->send(200, "application/json", "{\"ok\":true}");
+}
+
+void PcFanController::handle_api_apply_(AsyncWebServerRequest *request) {
+  std::string body;
+  if (request->hasArg("plain")) {
+    body = request->arg("plain");
+  } else if (request->hasArg("json")) {
+    body = request->arg("json");
+  } else {
+    request->send(409, "application/json", "{\"error\":\"missing json form field\"}");
+    return;
+  }
+
+  if (!this->apply_config_json_(body, false)) {
     request->send(409, "application/json", "{\"error\":\"invalid config json\"}");
     return;
   }

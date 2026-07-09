@@ -141,7 +141,7 @@ void PcFanController::regulate_channel_(Channel &channel) {
     channel.applied_pwm = 0.0f;
     channel.failsafe = true;
     channel.last_temp = NAN;
-    copy_string_(channel.status, sizeof(channel.status), "LEDC setup failed");
+    copy_string_(channel.status, sizeof(channel.status), "ERROR");
     channel.source_temp = NAN;
     publish_entities();
     return;
@@ -163,7 +163,7 @@ void PcFanController::regulate_channel_(Channel &channel) {
     channel.last_temp = NAN;
     const float pwm = clamp_(channel.manual_pwm, 0.0f, 100.0f);
     this->set_channel_pwm_(channel, pwm);
-    snprintf(channel.status, sizeof(channel.status), "MANUAL %.0f %%", pwm);
+    copy_string_(channel.status, sizeof(channel.status), "MANUAL");
     publish_entities();
     return;
   }
@@ -179,7 +179,7 @@ void PcFanController::regulate_channel_(Channel &channel) {
 
     const float pwm = clamp_(channel.default_pwm, 0.0f, 100.0f);
     this->set_channel_pwm_(channel, pwm);
-    snprintf(channel.status, sizeof(channel.status), "DEFAULT %.0f %%", pwm);
+    copy_string_(channel.status, sizeof(channel.status), "AUTO");
     publish_entities();
     return;
   }
@@ -191,8 +191,7 @@ void PcFanController::regulate_channel_(Channel &channel) {
   pwm = clamp_(pwm, channel.min_pwm, channel.max_pwm);
   this->set_channel_pwm_(channel, pwm);
 
-  snprintf(channel.status, sizeof(channel.status), "AUTO %s %.1f C -> %.0f %%", source_to_string_(channel.source),
-           temperature, pwm);
+  copy_string_(channel.status, sizeof(channel.status), "AUTO");
   publish_entities();
 }
 
