@@ -314,13 +314,23 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
     }
   }
 
+  function buildRuntimePayload() {
+    updateGlobalSettingsFromForm();
+    updateChannelFromForm();
+
+    return {
+      data_timeout_ms: config.data_timeout_ms,
+      update_interval_ms: config.update_interval_ms,
+      polling_enabled: config.polling_enabled,
+      channel: config.channels[activeIndex]
+    };
+  }
+
   async function applyDraft() {
     if (!config) return;
     setUiState("applying");
-    updateGlobalSettingsFromForm();
-    updateChannelFromForm();
     try {
-      await apiPost("/apply", config);
+      await apiPost("/apply", buildRuntimePayload());
       await loadStatus();
       setUiState("unsaved");
     } catch (error) {
@@ -702,7 +712,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
       updateChannelFromForm();
       setUiState("applying");
       try {
-        await apiPost("/config", config);
+        await apiPost("/config", buildRuntimePayload());
         await loadConfig();
         await loadStatus();
         setUiState("saved");
@@ -1151,7 +1161,54 @@ bool PcFanController::apply_config_json_(const std::string &data, bool persist) 
       this->polling_enabled_ = root["polling_enabled"].as<bool>();
     }
 
-    if (root["channels"].is<JsonArray>()) {
+    if (root["channel"].is<JsonObject>()) {
+      JsonObject channel_json = root["channel"].as<JsonObject>();
+
+      if (channel_json["id"].is<uint8_t>()) {
+        Channel *channel = this->channel_by_id_(channel_json["id"].as<uint8_t>());
+        if (channel != nullptr) {
+          if (channel_json["name"].is<const char *>()) {
+            copy_string_(channel->name, sizeof(channel->name), channel_json["name"].as<const char *>());
+          }
+
+          if (channel_json["source"].is<const char *>()) {
+            channel->source = source_from_string_(channel_json["source"].as<const char *>());
+          }
+
+          if (channel_json["mode"].is<const char *>()) {
+            channel->mode = mode_from_string_(channel_json["mode"].as<const char *>());
+          }
+
+          if (channel_json["inverted"].is<bool>()) {
+            channel->inverted = channel_json["inverted"].as<bool>();
+          }
+
+          if (is_number(channel_json["min_pwm"])) {
+            channel->min_pwm = clamp_(channel_json["min_pwm"].as<float>(), 0.0f, 100.0f);
+          }
+
+          if (is_number(channel_json["max_pwm"])) {
+            channel->max_pwm = clamp_(channel_json["max_pwm"].as<float>(), channel->min_pwm, 100.0f);
+          }
+
+          if (is_number(channel_json["default_pwm"])) {
+            channel->default_pwm = clamp_(channel_json["default_pwm"].as<float>(), 0.0f, 100.0f);
+          }
+
+          if (is_number(channel_json["manual_pwm"])) {
+            channel->manual_pwm = clamp_(channel_json["manual_pwm"].as<float>(), 0.0f, 100.0f);
+          }
+
+          if (is_number(channel_json["hysteresis"])) {
+            channel->hysteresis = clamp_(channel_json["hysteresis"].as<float>(), 0.0f, 20.0f);
+          }
+
+          if (channel_json["curve"].is<JsonArray>()) {
+            this->apply_curve_json_(*channel, channel_json["curve"].as<JsonArray>());
+          }
+        }
+      }
+    } else if (root["channels"].is<JsonArray>()) {
       for (JsonObject channel_json : root["channels"].as<JsonArray>()) {
         if (!channel_json["id"].is<uint8_t>()) {
           continue;

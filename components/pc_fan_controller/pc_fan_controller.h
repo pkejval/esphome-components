@@ -96,6 +96,7 @@ class PcFanController : public Component, public AsyncWebHandler {
     float manual_pwm{50.0f};
     float hysteresis{3.0f};
     float applied_pwm{0.0f};
+    float last_pwm_command{NAN};
     float source_temp{NAN};
     float last_temp{NAN};
     sensor::Sensor *temperature_sensor{nullptr};
@@ -104,6 +105,9 @@ class PcFanController : public Component, public AsyncWebHandler {
     bool setup_ok{false};
     bool failsafe{true};
     char status[80]{};
+    float last_published_source_temp{NAN};
+    float last_published_pwm{NAN};
+    char last_published_status[80]{};
     std::array<CurvePoint, MAX_CURVE_POINTS> curve{};
     uint8_t curve_count{0};
   };

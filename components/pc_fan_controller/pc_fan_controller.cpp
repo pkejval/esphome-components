@@ -111,6 +111,8 @@ void PcFanController::setup_ledc_() {
 
     esp_err_t channel_result = ledc_channel_config(&channel_config);
     channel.setup_ok = channel_result == ESP_OK;
+    channel.applied_pwm = channel.default_pwm;
+    channel.last_pwm_command = channel.default_pwm;
 
     if (!channel.setup_ok) {
       ESP_LOGE(TAG, "LEDC channel setup failed for %s: %d", channel.name, channel_result);
@@ -126,15 +128,22 @@ void PcFanController::regulate_() {
 }
 
 void PcFanController::regulate_channel_(Channel &channel) {
+  auto float_changed = [](float last, float current) {
+    return (std::isnan(last) != std::isnan(current)) || (!std::isnan(last) && !std::isnan(current) && fabsf(last - current) > 0.001f);
+  };
+
   auto publish_entities = [&]() {
-    if (channel.temperature_sensor != nullptr) {
+    if (channel.temperature_sensor != nullptr && float_changed(channel.last_published_source_temp, channel.source_temp)) {
       channel.temperature_sensor->publish_state(channel.source_temp);
+      channel.last_published_source_temp = channel.source_temp;
     }
-    if (channel.pwm_sensor != nullptr) {
+    if (channel.pwm_sensor != nullptr && float_changed(channel.last_published_pwm, channel.applied_pwm)) {
       channel.pwm_sensor->publish_state(channel.applied_pwm);
+      channel.last_published_pwm = channel.applied_pwm;
     }
-    if (channel.status_text_sensor != nullptr) {
+    if (channel.status_text_sensor != nullptr && strcmp(channel.last_published_status, channel.status) != 0) {
       channel.status_text_sensor->publish_state(channel.status);
+      copy_string_(channel.last_published_status, sizeof(channel.last_published_status), channel.status);
     }
   };
 
@@ -199,9 +208,15 @@ void PcFanController::regulate_channel_(Channel &channel) {
 void PcFanController::set_channel_pwm_(Channel &channel, float pwm) {
 #ifdef USE_ESP32
   pwm = clamp_(pwm, 0.0f, 100.0f);
+  if (!std::isnan(channel.last_pwm_command) && fabsf(channel.last_pwm_command - pwm) < 0.001f) {
+    channel.applied_pwm = pwm;
+    return;
+  }
+
   const uint32_t duty = this->duty_for_pwm_(channel, pwm);
   ledc_set_duty(LEDC_LOW_SPEED_MODE, static_cast<ledc_channel_t>(channel.ledc_channel), duty);
   ledc_update_duty(LEDC_LOW_SPEED_MODE, static_cast<ledc_channel_t>(channel.ledc_channel));
+  channel.last_pwm_command = pwm;
   channel.applied_pwm = pwm;
 #endif
 }
