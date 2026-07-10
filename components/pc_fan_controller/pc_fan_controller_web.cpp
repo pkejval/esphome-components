@@ -30,7 +30,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
 <section class="wrap">
   <header class="topbar">
     <div>
-      <h1 id="pageTitle">__TITLE__</h1>
+      <a id="pageTitle" class="page-title" href="/">__TITLE__</a>
     </div>
     <div class="status" id="connectionStatus">Načítám...</div>
   </header>
@@ -95,6 +95,8 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   .topbar { display: flex; justify-content: space-between; gap: 16px; align-items: center; margin-bottom: 18px; }
   h1, h2 { margin: 0; }
   h1 { font-size: 28px; }
+  .page-title { color: inherit; text-decoration: none; cursor: pointer; font-size: 28px; font-weight: 700; }
+  .page-title:hover { text-decoration: underline; }
   h2 { font-size: 20px; margin-bottom: 12px; }
   p { margin: 6px 0 0; color: var(--muted); }
   .status { border: 1px solid var(--border); border-radius: 999px; padding: 8px 12px; background: var(--panel); white-space: nowrap; }
