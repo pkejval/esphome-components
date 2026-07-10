@@ -39,6 +39,7 @@ void PcFanController::dump_config() {
   ESP_LOGCONFIG(TAG, "  PWM frequency: %" PRIu32 " Hz", this->pwm_frequency_);
   ESP_LOGCONFIG(TAG, "  Update interval: %" PRIu32 " ms", this->update_interval_ms_);
   ESP_LOGCONFIG(TAG, "  Data timeout: %" PRIu32 " ms", this->data_timeout_ms_);
+  ESP_LOGCONFIG(TAG, "  Polling enabled: %s", this->polling_enabled_ ? "yes" : "no");
   ESP_LOGCONFIG(TAG, "  UI path: %s", this->ui_path_.c_str());
   ESP_LOGCONFIG(TAG, "  API path: %s", this->api_path_.c_str());
 
@@ -479,6 +480,7 @@ void PcFanController::save_config_() {
   stored.channel_count = this->channel_count_;
   stored.data_timeout_ms = this->data_timeout_ms_;
   stored.update_interval_ms = this->update_interval_ms_;
+  stored.polling_enabled = this->polling_enabled_;
 
   for (uint8_t i = 0; i < this->channel_count_; i++) {
     const auto &channel = this->channels_[i];
@@ -524,6 +526,7 @@ void PcFanController::load_config_() {
 
   this->data_timeout_ms_ = stored.data_timeout_ms;
   this->update_interval_ms_ = stored.update_interval_ms;
+  this->polling_enabled_ = stored.polling_enabled;
 
   for (uint8_t i = 0; i < this->channel_count_; i++) {
     auto &channel = this->channels_[i];

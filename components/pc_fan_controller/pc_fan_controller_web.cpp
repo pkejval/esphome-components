@@ -35,6 +35,12 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
     <div class="status" id="connectionStatus">Načítám...</div>
   </header>
 
+  <div class="banner-row">
+    <div class="ui-state saved" id="uiState">SAVED</div>
+    <div class="ui-error" id="uiError" hidden></div>
+    <label class="polling-toggle"><input type="checkbox" id="pollingEnabled"> Stop polling</label>
+  </div>
+
   <section class="cards">
     <article><span>CPU</span><strong id="cpuTemp">--</strong></article>
     <article><span>GPU</span><strong id="gpuTemp">--</strong></article>
@@ -92,6 +98,15 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   h2 { font-size: 20px; margin-bottom: 12px; }
   p { margin: 6px 0 0; color: var(--muted); }
   .status { border: 1px solid var(--border); border-radius: 999px; padding: 8px 12px; background: var(--panel); white-space: nowrap; }
+  .banner-row { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+  .ui-state { border: 1px solid var(--border); border-radius: 999px; padding: 6px 10px; font-size: 13px; letter-spacing: 0.04em; text-transform: uppercase; }
+  .ui-state.saved { background: rgba(74, 222, 128, 0.12); color: var(--ok); }
+  .ui-state.dirty { background: rgba(250, 204, 21, 0.12); color: #f59e0b; }
+  .ui-state.applying { background: rgba(56, 189, 248, 0.12); color: var(--accent); }
+  .ui-state.error { background: rgba(251, 113, 133, 0.12); color: var(--danger); }
+  .polling-toggle { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--border); border-radius: 999px; padding: 6px 10px; font-size: 13px; background: var(--panel); color: var(--text); }
+  .polling-toggle input { margin: 0; width: auto; }
+  .ui-error { border: 1px solid var(--danger); border-radius: 12px; padding: 8px 10px; color: var(--danger); background: rgba(251, 113, 133, 0.08); flex: 1; min-width: 220px; }
   .cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
   .cards article, .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 14px; }
   .cards span { color: var(--muted); display: block; font-size: 14px; margin-bottom: 5px; }
@@ -178,12 +193,16 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   let curveDrag = null;
   let curveHover = null;
   let applyTimer = null;
+  let pollTimer = null;
+  let dirtyTimer = null;
   const GRAPH_WIDTH = 560;
   const GRAPH_HEIGHT = 260;
   const GRAPH_MARGIN = { left: 28, right: 18, top: 16, bottom: 34 };
 
   const tabs = document.getElementById("tabs");
   const editor = document.getElementById("channelEditor");
+  const uiState = document.getElementById("uiState");
+  const uiError = document.getElementById("uiError");
 
   document.title = document.getElementById("pageTitle")?.textContent ?? "PC Fan Controller";
 
@@ -238,11 +257,73 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
     return response;
   }
 
+  function showUiError(message) {
+    if (!uiError) return;
+    if (!message) {
+      uiError.hidden = true;
+      uiError.textContent = "";
+      return;
+    }
+
+    uiError.textContent = message;
+    uiError.hidden = false;
+  }
+
+  function setUiState(state, message) {
+    if (!uiState) return;
+
+    uiState.className = `ui-state ${state}`;
+    uiState.textContent = state.toUpperCase();
+
+    if (state === "error") {
+      showUiError(message ?? "Neznámá chyba");
+    } else {
+      showUiError("");
+    }
+  }
+
+  function syncPollingUi() {
+    const checkbox = document.getElementById("pollingEnabled");
+    if (checkbox !== null && config !== null) {
+      checkbox.checked = !!config.polling_enabled;
+    }
+  }
+
+  function markDirty() {
+    if (dirtyTimer !== null) {
+      clearTimeout(dirtyTimer);
+    }
+
+    setUiState("dirty");
+    dirtyTimer = setTimeout(() => {
+      dirtyTimer = null;
+      if (!applyTimer) {
+        setUiState("dirty");
+      }
+    }, 0);
+  }
+
+  function updateGlobalSettingsFromForm() {
+    if (!config) return;
+    const checkbox = document.getElementById("pollingEnabled");
+    if (checkbox !== null) {
+      config.polling_enabled = checkbox.checked;
+    }
+  }
+
   async function applyDraft() {
     if (!config) return;
+    setUiState("applying");
+    updateGlobalSettingsFromForm();
     updateChannelFromForm();
-    await apiPost("/apply", config);
-    await loadStatus();
+    try {
+      await apiPost("/apply", config);
+      await loadStatus();
+      setUiState("saved");
+    } catch (error) {
+      setUiState("error", error instanceof Error ? error.message : String(error));
+      throw error;
+    }
   }
 
   function scheduleApply() {
@@ -258,6 +339,33 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
         console.error(error);
       }
     }, 500);
+  }
+
+  function startPolling() {
+    stopPolling();
+    if (document.hidden || !config || !config.polling_enabled) return;
+
+    pollTimer = setInterval(() => {
+      loadStatus().catch((error) => {
+        setUiState("error", error instanceof Error ? error.message : String(error));
+      });
+    }, 1000);
+  }
+
+  function stopPolling() {
+    if (pollTimer !== null) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  function syncPollingState() {
+    syncPollingUi();
+    if (config?.polling_enabled) {
+      startPolling();
+    } else {
+      stopPolling();
+    }
   }
 
   function normalizeCurve(channel) {
@@ -356,6 +464,47 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
     return segmentHit;
   }
 
+  function updateCurveGraph(channel) {
+    const svg = document.getElementById("curveGraphSvg");
+    if (svg === null) return;
+
+    const points = channel.curve.map(curveToSvgPoint);
+    const path = svg.querySelector('[data-role="curve-path"]');
+    if (path !== null) {
+      path.setAttribute("d", points.length > 0 ? `M ${points.map((point) => `${point.x},${point.y}`).join(" L ")}` : "");
+    }
+
+    svg.querySelectorAll("[data-segment]").forEach((node) => {
+      const index = Number(node.getAttribute("data-segment"));
+      const point = points[index];
+      const next = points[index + 1];
+      if (!point || !next) return;
+
+      node.setAttribute("x1", String(point.x));
+      node.setAttribute("y1", String(point.y));
+      node.setAttribute("x2", String(next.x));
+      node.setAttribute("y2", String(next.y));
+      node.classList.toggle("is-hovered", curveHover?.kind === "segment" && curveHover.index === index);
+    });
+
+    svg.querySelectorAll("[data-index]").forEach((node) => {
+      const index = Number(node.getAttribute("data-index"));
+      const point = points[index];
+      if (!point) return;
+
+      const circles = node.querySelectorAll("circle");
+      if (circles.length >= 2) {
+        circles[0].setAttribute("cx", String(point.x));
+        circles[0].setAttribute("cy", String(point.y));
+        circles[1].setAttribute("cx", String(point.x));
+        circles[1].setAttribute("cy", String(point.y));
+      }
+
+      node.classList.toggle("is-hovered", curveHover?.kind === "point" && curveHover.index === index);
+      node.classList.toggle("is-endpoint", curveHover?.kind === "segment" && (curveHover.index === index || curveHover.index + 1 === index));
+    });
+  }
+
   function insertPointOnSegment(channel, segmentIndex, point) {
     channel.curve.splice(segmentIndex + 1, 0, svgToCurvePoint(point.x, point.y));
     normalizeCurve(channel);
@@ -385,6 +534,9 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
     config = await apiGet("/config");
     renderTabs();
     renderEditor();
+    syncPollingUi();
+    setUiState("saved");
+    syncPollingState();
   }
 
   async function loadStatus() {
@@ -512,10 +664,14 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
     document.getElementById("inverted").value = String(channel.inverted);
 
     ["channelName", "channelSource", "minPwm", "maxPwm", "defaultPwm", "manualPwm", "hysteresis", "inverted"]
-      .forEach((id) => document.getElementById(id).addEventListener("input", scheduleApply));
+      .forEach((id) => document.getElementById(id).addEventListener("input", () => {
+        markDirty();
+        scheduleApply();
+      }));
 
     document.getElementById("channelMode").addEventListener("change", (event) => {
       updateChannelFromForm(event);
+      markDirty();
       scheduleApply();
       renderEditor();
     });
@@ -525,6 +681,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
       const last = channel.curve[channel.curve.length - 1] ?? { temp: 35, pwm: 25 };
       channel.curve.push({ temp: Math.min(100, last.temp + 5), pwm: Math.min(100, last.pwm + 5) });
       normalizeCurve(channel);
+      markDirty();
       scheduleApply();
       renderEditor();
     });
@@ -532,18 +689,40 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
     document.getElementById("removePoint").addEventListener("click", () => {
       if (channel.curve.length <= 2) return;
       channel.curve.pop();
+      markDirty();
       scheduleApply();
       renderEditor();
     });
 
     document.getElementById("saveConfig").addEventListener("click", async () => {
+      updateGlobalSettingsFromForm();
       updateChannelFromForm();
-      await apiPost("/config", config);
-      await loadConfig();
-      await loadStatus();
+      setUiState("applying");
+      try {
+        await apiPost("/config", config);
+        await loadConfig();
+        await loadStatus();
+        setUiState("saved");
+      } catch (error) {
+        setUiState("error", error instanceof Error ? error.message : String(error));
+      }
     });
 
-    document.getElementById("reloadConfig").addEventListener("click", loadConfig);
+    document.getElementById("reloadConfig").addEventListener("click", async () => {
+      try {
+        await loadConfig();
+      } catch (error) {
+        setUiState("error", error instanceof Error ? error.message : String(error));
+      }
+    });
+
+    document.getElementById("pollingEnabled").addEventListener("change", async (event) => {
+      if (!config) return;
+      config.polling_enabled = event.target.checked;
+      markDirty();
+      syncPollingState();
+      scheduleApply();
+    });
 
     renderCurveGraph(channel);
     renderCurveTable(channel);
@@ -610,6 +789,8 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
         const insertedIndex = addGraphPoint(channel);
         if (insertedIndex !== null) {
           curveHover = { kind: "point", index: insertedIndex };
+          markDirty();
+          scheduleApply();
           renderCurveGraph(channel);
           renderCurveTable(channel);
         }
@@ -623,13 +804,13 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
       if (curveDrag !== null) return;
       const point = getSvgPoint(svg, event);
       curveHover = hitTestCurve(channel, point.x, point.y);
-      renderCurveGraph(channel);
+      updateCurveGraph(channel);
     });
 
     svg.addEventListener("pointerleave", () => {
       if (curveDrag !== null) return;
       curveHover = null;
-      renderCurveGraph(channel);
+      updateCurveGraph(channel);
     });
 
     svg.addEventListener("pointerdown", (event) => {
@@ -671,8 +852,8 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
     const y = point.y;
 
     channel.curve[curveDrag.index] = svgToCurvePoint(x, y);
-    renderCurveGraph(channel);
-    renderCurveTable(channel);
+    markDirty();
+    updateCurveGraph(channel);
   }
 
   window.addEventListener("pointermove", (event) => {
@@ -681,16 +862,16 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   });
 
   window.addEventListener("pointerup", () => {
-    if (curveDrag !== null) {
-      const channel = config?.channels?.[activeIndex];
-      if (channel !== undefined) {
-        normalizeCurve(channel);
-        renderCurveGraph(channel);
-        renderCurveTable(channel);
-        scheduleApply();
+      if (curveDrag !== null) {
+        const channel = config?.channels?.[activeIndex];
+        if (channel !== undefined) {
+          normalizeCurve(channel);
+          renderCurveTable(channel);
+          updateCurveGraph(channel);
+          scheduleApply();
+        }
       }
-    }
-    curveDrag = null;
+      curveDrag = null;
   });
 
   window.addEventListener("pointercancel", () => {
@@ -722,7 +903,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
         if (!Number.isFinite(value) || !channel.curve[index]) return;
         channel.curve[index][kind] = kind === "temp" ? clamp(value, 0, 100) : clamp(value, 0, 100);
         normalizeCurve(channel);
-        renderCurveGraph(channel);
+        updateCurveGraph(channel);
         renderCurveTable(channel);
         scheduleApply();
       });
@@ -759,16 +940,23 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   loadConfig().catch((error) => {
     document.getElementById("connectionStatus").textContent = error.message;
     document.getElementById("connectionStatus").className = "status danger";
+    setUiState("error", error instanceof Error ? error.message : String(error));
   });
 
-  loadStatus().catch(() => {});
+  loadStatus().catch((error) => {
+    setUiState("error", error instanceof Error ? error.message : String(error));
+  });
 
-  setInterval(() => {
-    loadStatus().catch(() => {
-      document.getElementById("connectionStatus").textContent = "OFFLINE";
-      document.getElementById("connectionStatus").className = "status danger";
-    });
-  }, 1000);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      stopPolling();
+      return;
+    }
+
+    startPolling();
+  });
+
+  startPolling();
 </script>
 )HTML";
 
@@ -845,6 +1033,7 @@ std::string PcFanController::build_config_json_() const {
     root["data_timeout_ms"] = this->data_timeout_ms_;
     root["update_interval_ms"] = this->update_interval_ms_;
     root["pwm_frequency"] = this->pwm_frequency_;
+    root["polling_enabled"] = this->polling_enabled_;
 
     JsonArray channels = root["channels"].to<JsonArray>();
 
@@ -951,6 +1140,10 @@ bool PcFanController::apply_config_json_(const std::string &data, bool persist) 
 
     if (root["update_interval_ms"].is<uint32_t>()) {
       this->update_interval_ms_ = root["update_interval_ms"].as<uint32_t>();
+    }
+
+    if (root["polling_enabled"].is<bool>()) {
+      this->polling_enabled_ = root["polling_enabled"].as<bool>();
     }
 
     if (root["channels"].is<JsonArray>()) {

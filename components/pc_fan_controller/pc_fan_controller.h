@@ -38,6 +38,7 @@ class PcFanController : public Component, public AsyncWebHandler {
   void set_ui_path(const std::string &ui_path) { this->ui_path_ = ui_path; }
   void set_api_path(const std::string &api_path) { this->api_path_ = api_path; }
   void set_ui_title(const std::string &ui_title) { this->ui_title_ = ui_title; }
+  void set_polling_enabled(bool polling_enabled) { this->polling_enabled_ = polling_enabled; }
   void set_temperature(const char *source, float value);
   void set_channel_temperature_sensor(uint8_t channel_id, sensor::Sensor *sensor);
   void set_channel_pwm_sensor(uint8_t channel_id, sensor::Sensor *sensor);
@@ -54,7 +55,7 @@ class PcFanController : public Component, public AsyncWebHandler {
  protected:
   static constexpr uint8_t MAX_CURVE_POINTS = 8;
   static constexpr uint32_t PREFERENCE_MAGIC = 0x50434643;
-  static constexpr uint32_t PREFERENCE_VERSION = 3;
+  static constexpr uint32_t PREFERENCE_VERSION = 4;
   static constexpr uint32_t PWM_DUTY_MAX = 1023;
 
   enum class InputSource : uint8_t {
@@ -132,6 +133,7 @@ class PcFanController : public Component, public AsyncWebHandler {
     uint8_t channel_count;
     uint32_t data_timeout_ms;
     uint32_t update_interval_ms;
+    bool polling_enabled;
     StoredChannel channels[USE_PC_FAN_CONTROLLER_MAX_CHANNELS];
   };
 
@@ -146,6 +148,7 @@ class PcFanController : public Component, public AsyncWebHandler {
   std::string ui_path_{"/fan-control"};
   std::string api_path_{"/fan-api"};
   std::string ui_title_{"PC Fan Controller"};
+  bool polling_enabled_{true};
 
   float input_cpu_{NAN};
   float input_gpu_{NAN};

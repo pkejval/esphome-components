@@ -42,6 +42,7 @@ CONF_UI_PATH = "ui_path"
 CONF_VALUE = "value"
 CONF_TEMPERATURE_SENSOR = "temperature_sensor"
 CONF_PWM_SENSOR = "pwm_sensor"
+CONF_POLLING_ENABLED = "polling_enabled"
 CONF_STATUS_TEXT_SENSOR = "status_text_sensor"
 
 pc_fan_controller_ns = cg.esphome_ns.namespace("pc_fan_controller")
@@ -153,6 +154,7 @@ CONFIG_SCHEMA = cv.All(
                 cv.string,
                 cv.Length(min=1, max=40),
             ),
+            cv.Optional(CONF_POLLING_ENABLED, default=True): cv.boolean,
             cv.Required(CONF_CHANNELS): cv.All(
                 cv.ensure_list(CHANNEL_SCHEMA),
                 cv.Length(min=1, max=8),
@@ -178,6 +180,7 @@ async def to_code(config):
     cg.add(var.set_pwm_frequency(config[CONF_PWM_FREQUENCY]))
     cg.add(var.set_ui_path(config[CONF_UI_PATH]))
     cg.add(var.set_api_path(config[CONF_API_PATH]))
+    cg.add(var.set_polling_enabled(config[CONF_POLLING_ENABLED]))
 
     ui_title = CORE.friendly_name or CORE.name
     cg.add(var.set_ui_title(ui_title))
