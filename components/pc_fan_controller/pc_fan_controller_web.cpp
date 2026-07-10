@@ -905,10 +905,12 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
 
         if (!Number.isFinite(value) || !channel.curve[index]) return;
         channel.curve[index][kind] = kind === "temp" ? clamp(value, 0, 100) : clamp(value, 0, 100);
-        normalizeCurve(channel);
         updateCurveGraph(channel);
-        renderCurveTable(channel);
         scheduleApply();
+      });
+
+      input.addEventListener("blur", () => {
+        updateCurveGraph(channel);
       });
     });
   }
