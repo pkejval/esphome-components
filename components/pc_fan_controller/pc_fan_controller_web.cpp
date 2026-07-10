@@ -286,7 +286,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   function syncPollingUi() {
     const checkbox = document.getElementById("pollingEnabled");
     if (checkbox !== null && config !== null) {
-      checkbox.checked = !!config.polling_enabled;
+      checkbox.checked = !config.polling_enabled;
     }
   }
 
@@ -308,7 +308,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
     if (!config) return;
     const checkbox = document.getElementById("pollingEnabled");
     if (checkbox !== null) {
-      config.polling_enabled = checkbox.checked;
+      config.polling_enabled = !checkbox.checked;
     }
   }
 
@@ -719,7 +719,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
 
     document.getElementById("pollingEnabled").addEventListener("change", async (event) => {
       if (!config) return;
-      config.polling_enabled = event.target.checked;
+      config.polling_enabled = !event.target.checked;
       markDirty();
       syncPollingState();
       scheduleApply();
