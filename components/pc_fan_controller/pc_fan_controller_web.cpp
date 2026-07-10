@@ -103,6 +103,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
   .ui-state.saved { background: rgba(74, 222, 128, 0.12); color: var(--ok); }
   .ui-state.dirty { background: rgba(250, 204, 21, 0.12); color: #f59e0b; }
   .ui-state.applying { background: rgba(56, 189, 248, 0.12); color: var(--accent); }
+  .ui-state.unsaved { background: rgba(56, 189, 248, 0.12); color: var(--accent); }
   .ui-state.error { background: rgba(251, 113, 133, 0.12); color: var(--danger); }
   .polling-toggle { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--border); border-radius: 999px; padding: 6px 10px; font-size: 13px; background: var(--panel); color: var(--text); }
   .polling-toggle input { margin: 0; width: auto; }
@@ -319,7 +320,7 @@ static const char FAN_CONTROL_HTML[] = R"HTML(
     try {
       await apiPost("/apply", config);
       await loadStatus();
-      setUiState("saved");
+      setUiState("unsaved");
     } catch (error) {
       setUiState("error", error instanceof Error ? error.message : String(error));
       throw error;
