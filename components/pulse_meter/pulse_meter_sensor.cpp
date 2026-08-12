@@ -381,7 +381,7 @@ void PulseMeterSensor::loop() {
 
       for (size_t i = 0; i < local_sym_count; ++i) {
         const auto &w = this->rmt_rx_buffer_[i];
-        const bool levels[] = {w.level0, w.level1};
+        const bool levels[] = {w.level0 != 0, w.level1 != 0};
         const uint32_t durations[] = {w.duration0, w.duration1};
 
         for (uint8_t part = 0; part < 2; part++) {
