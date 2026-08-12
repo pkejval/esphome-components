@@ -58,6 +58,10 @@ void PulseMeterSensor::setup() {
   this->last_polled_pin_val_ = this->isr_pin_.digital_read();
   this->next_poll_check_us_ = now + 2000U;
 
+  this->pulse_state_.last_intr_ = now;
+  this->pulse_state_.last_pin_val_ = this->last_polled_pin_val_;
+  this->pulse_state_.latched_ = this->last_polled_pin_val_;
+
   this->coalesce_enabled_edge_ = (this->filter_mode_ == FILTER_EDGE);
 
   if (this->min_low_us_ == 0 && this->min_high_us_ == 0) {
@@ -91,7 +95,6 @@ void PulseMeterSensor::setup() {
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
   if (this->filter_mode_ == FILTER_PULSE) {
     this->rmt_pending_ = false;
-    this->rmt_recv_symbols_ = nullptr;
     this->rmt_recv_count_ = 0;
     this->rmt_done_us_ = 0;
 
@@ -99,7 +102,7 @@ void PulseMeterSensor::setup() {
     ch_cfg.gpio_num = (gpio_num_t) this->pin_->get_pin();
     ch_cfg.clk_src = RMT_CLK_SRC_DEFAULT;
     ch_cfg.resolution_hz = this->rmt_resolution_hz_;
-    ch_cfg.mem_block_symbols = 512;
+    ch_cfg.mem_block_symbols = RMT_RX_BUFFER_SYMBOLS;
 
     if (rmt_new_rx_channel(&ch_cfg, &this->rmt_rx_channel_) == ESP_OK && this->rmt_rx_channel_ != nullptr) {
       rmt_rx_event_callbacks_t cbs{};
@@ -107,24 +110,32 @@ void PulseMeterSensor::setup() {
 
       if (rmt_rx_register_event_callbacks(this->rmt_rx_channel_, &cbs, this) == ESP_OK) {
         rmt_receive_config_t rx_cfg{};
-        rx_cfg.signal_range_min_ns = (uint32_t) (this->filter_us_ * 1000ULL);
-
-        const uint32_t timeout_ns = (this->timeout_us_ > 0 ? this->timeout_us_ : 1000000UL) * 1000UL;
-        rx_cfg.signal_range_max_ns = timeout_ns;
+        const uint32_t filter_us = this->filter_us_ > RMT_MAX_SIGNAL_RANGE_US
+                                       ? RMT_MAX_SIGNAL_RANGE_US
+                                       : this->filter_us_;
+        const uint32_t frame_timeout_us = this->timeout_us_ > RMT_MAX_SIGNAL_RANGE_US
+                                              ? RMT_MAX_SIGNAL_RANGE_US
+                                              : this->timeout_us_;
+        rx_cfg.signal_range_min_ns = filter_us * 1000U;
+        rx_cfg.signal_range_max_ns = frame_timeout_us * 1000U;
 
         this->rmt_rx_cfg_ = rx_cfg;
 
         if (rmt_enable(this->rmt_rx_channel_) == ESP_OK &&
-            rmt_receive(this->rmt_rx_channel_, nullptr, 0, &this->rmt_rx_cfg_) == ESP_OK) {
+            rmt_receive(this->rmt_rx_channel_, this->rmt_rx_buffer_, sizeof(this->rmt_rx_buffer_),
+                        &this->rmt_rx_cfg_) == ESP_OK) {
           this->use_rmt_ = true;
         }
       }
     }
 
     if (!this->use_rmt_) {
+      if (this->rmt_rx_channel_ != nullptr) {
+        (void) rmt_disable(this->rmt_rx_channel_);
+        (void) rmt_del_channel(this->rmt_rx_channel_);
+      }
       this->rmt_rx_channel_ = nullptr;
       this->rmt_pending_ = false;
-      this->rmt_recv_symbols_ = nullptr;
       this->rmt_recv_count_ = 0;
       this->rmt_done_us_ = 0;
     }
@@ -153,7 +164,6 @@ void PulseMeterSensor::setup() {
 void PulseMeterSensor::loop() {
   const uint32_t now = micros();
   bool do_poll = false;
-  bool poll_sampled = false;
   bool poll_current = false;
 
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
@@ -163,7 +173,7 @@ void PulseMeterSensor::loop() {
   if (LIKELY(!this->new_event_) && LIKELY(time_before_(now, this->next_timeout_check_us_))) {
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
     if (use_rmt) {
-      if (!this->rmt_pending_ && this->rmt_recv_count_ == 0) {
+      if (!__atomic_load_n(&this->rmt_pending_, __ATOMIC_ACQUIRE) && this->rmt_recv_count_ == 0) {
         return;
       }
     } else
@@ -175,9 +185,8 @@ void PulseMeterSensor::loop() {
       }
 
       poll_current = this->isr_pin_.digital_read();
-      poll_sampled = true;
 
-      if (poll_sampled && poll_current == this->last_polled_pin_val_) {
+      if (poll_current == this->last_polled_pin_val_) {
         this->last_polled_pin_val_ = poll_current;
         this->schedule_next_poll_(now);
         return;
@@ -191,7 +200,6 @@ void PulseMeterSensor::loop() {
   bool had_event = false;
 
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
-  const rmt_symbol_word_t *local_syms = nullptr;
   size_t local_sym_count = 0;
   uint32_t local_rmt_done_us = 0;
   bool local_rmt_consumed = false;
@@ -202,12 +210,10 @@ void PulseMeterSensor::loop() {
 
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
     if (use_rmt) {
-      if (this->rmt_pending_ || this->rmt_recv_count_ != 0 || this->rmt_recv_symbols_ != nullptr) {
-        local_syms = (const rmt_symbol_word_t *) this->rmt_recv_symbols_;
+      if (__atomic_load_n(&this->rmt_pending_, __ATOMIC_ACQUIRE) || this->rmt_recv_count_ != 0) {
         local_sym_count = (size_t) this->rmt_recv_count_;
         local_rmt_done_us = this->rmt_done_us_;
-        this->rmt_pending_ = false;
-        this->rmt_recv_symbols_ = nullptr;
+        __atomic_store_n(&this->rmt_pending_, false, __ATOMIC_RELEASE);
         this->rmt_recv_count_ = 0;
         this->rmt_done_us_ = 0;
         local_rmt_consumed = true;
@@ -250,11 +256,7 @@ void PulseMeterSensor::loop() {
 
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
   if (use_rmt && local_rmt_consumed) {
-    if (this->rmt_rx_channel_ != nullptr) {
-      (void) rmt_receive(this->rmt_rx_channel_, nullptr, 0, &this->rmt_rx_cfg_);
-    }
-
-    if (local_syms != nullptr && local_sym_count > 0) {
+    if (local_sym_count > 0) {
       bool latched = this->pulse_state_.latched_;
       bool last_pin = this->pulse_state_.last_pin_val_;
       uint32_t last_edge_us = tdet;
@@ -267,42 +269,32 @@ void PulseMeterSensor::loop() {
       const uint32_t frame_done_us = (local_rmt_done_us != 0) ? local_rmt_done_us : now;
 
       for (size_t i = 0; i < local_sym_count; ++i) {
-        const auto &w = local_syms[i];
+        const auto &w = this->rmt_rx_buffer_[i];
+        const bool levels[] = {w.level0, w.level1};
+        const uint32_t durations[] = {w.duration0, w.duration1};
 
-        const bool lvl0 = w.level0;
-        const uint32_t dur0_us = w.duration0;
-        elapsed_us += dur0_us;
-        if (lvl0 != last_pin) {
-          if (!last_pin) {
-            if (dur0_us >= this->min_low_us_) {
-              latched = false;
-            }
-          } else {
-            if (dur0_us >= this->min_high_us_) {
+        for (uint8_t part = 0; part < 2; part++) {
+          const uint32_t duration_us = durations[part];
+          if (duration_us == 0)
+            continue;
+
+          const bool level = levels[part];
+          const uint32_t segment_start_offset_us = elapsed_us;
+          elapsed_us += duration_us;
+
+          // Every RMT part describes the duration of its own level. Qualify that
+          // completed level directly, rather than applying its duration to the
+          // preceding level on a transition.
+          if (level) {
+            if (!latched && duration_us >= this->min_high_us_) {
               latched = true;
-              last_edge_offset_us = elapsed_us;
+              last_edge_offset_us = segment_start_offset_us;
               add_cnt++;
             }
+          } else if (latched && duration_us >= this->min_low_us_) {
+            latched = false;
           }
-          last_pin = lvl0;
-        }
-
-        const bool lvl1 = w.level1;
-        const uint32_t dur1_us = w.duration1;
-        elapsed_us += dur1_us;
-        if (lvl1 != last_pin) {
-          if (!last_pin) {
-            if (dur1_us >= this->min_low_us_) {
-              latched = false;
-            }
-          } else {
-            if (dur1_us >= this->min_high_us_) {
-              latched = true;
-              last_edge_offset_us = elapsed_us;
-              add_cnt++;
-            }
-          }
-          last_pin = lvl1;
+          last_pin = level;
         }
       }
 
@@ -318,6 +310,28 @@ void PulseMeterSensor::loop() {
         trise = last_rise_us;
         had_event = true;
       }
+    }
+
+    // The RMT driver writes into rmt_rx_buffer_. Do not re-arm it until every
+    // symbol above has been consumed.
+    if (this->rmt_rx_channel_ != nullptr &&
+        rmt_receive(this->rmt_rx_channel_, this->rmt_rx_buffer_, sizeof(this->rmt_rx_buffer_),
+                    &this->rmt_rx_cfg_) != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to restart RMT receive; falling back to GPIO interrupts");
+      (void) rmt_disable(this->rmt_rx_channel_);
+      (void) rmt_del_channel(this->rmt_rx_channel_);
+      this->rmt_rx_channel_ = nullptr;
+      this->use_rmt_ = false;
+
+      const bool pin_val = this->isr_pin_.digital_read();
+      this->pulse_state_.last_intr_ = now;
+      this->pulse_state_.last_pin_val_ = pin_val;
+      this->pulse_state_.latched_ = pin_val;
+#if (defined(portNUM_PROCESSORS) && (portNUM_PROCESSORS > 1))
+      xTaskCreatePinnedToCore(PulseMeterSensor::attach_isr_task_, "pm_attach_isr", 2048, this, 20, nullptr, 1);
+#else
+      this->pin_->attach_interrupt(PulseMeterSensor::pulse_intr, this, gpio::INTERRUPT_ANY_EDGE);
+#endif
     }
   }
 #endif
@@ -515,19 +529,20 @@ bool IRAM_ATTR PulseMeterSensor::rmt_rx_done_cb_(rmt_channel_handle_t, const rmt
                                                  void *user_ctx) {
   auto *self = static_cast<PulseMeterSensor *>(user_ctx);
 
-  self->rmt_done_us_ = micros();
-  self->rmt_pending_ = true;
-
-  if (edata == nullptr || edata->received_symbols == nullptr || edata->num_symbols == 0) {
-    self->rmt_recv_symbols_ = nullptr;
+  if (edata == nullptr || edata->received_symbols != self->rmt_rx_buffer_ || edata->num_symbols == 0) {
     self->rmt_recv_count_ = 0;
-    self->new_event_ = true;
-    return false;
+  } else {
+    // received_symbols points to the application-owned buffer passed to
+    // rmt_receive(). Keep only its length; retaining a driver-owned pointer past
+    // this callback would be unsafe.
+    self->rmt_recv_count_ =
+        edata->num_symbols > RMT_RX_BUFFER_SYMBOLS ? RMT_RX_BUFFER_SYMBOLS : edata->num_symbols;
   }
 
-  self->rmt_recv_symbols_ = edata->received_symbols;
-  self->rmt_recv_count_ = edata->num_symbols;
+  self->rmt_done_us_ = micros();
   self->new_event_ = true;
+  // Publish this last so the loop sees a complete RX frame on dual-core chips.
+  __atomic_store_n(&self->rmt_pending_, true, __ATOMIC_RELEASE);
   return false;
 }
 #endif

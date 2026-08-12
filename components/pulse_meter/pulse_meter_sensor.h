@@ -211,12 +211,16 @@ class PulseMeterSensor : public sensor::Sensor, public Component {
 #endif
 
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
+  static constexpr size_t RMT_RX_BUFFER_SYMBOLS = 512;
+  // signal_range_max_ns is a uint32_t in the ESP-IDF API.
+  static constexpr uint32_t RMT_MAX_SIGNAL_RANGE_US = UINT32_MAX / 1000U;
+
   rmt_channel_handle_t rmt_rx_channel_{nullptr};
   rmt_receive_config_t rmt_rx_cfg_{};
   uint32_t rmt_resolution_hz_{1000000UL};
+  rmt_symbol_word_t rmt_rx_buffer_[RMT_RX_BUFFER_SYMBOLS]{};
 
   volatile bool rmt_pending_{false};
-  volatile const rmt_symbol_word_t *rmt_recv_symbols_{nullptr};
   volatile size_t rmt_recv_count_{0};
   volatile uint32_t rmt_done_us_{0};
 #endif
