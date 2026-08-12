@@ -9,6 +9,105 @@ namespace pulse_meter {
 
 static const char *const TAG = "pulse_meter";
 
+#if ESPHOME_PULSE_METER_HAS_PCNT
+bool IRAM_ATTR PulseMeterSensor::pcnt_on_reach_(pcnt_unit_handle_t unit, const pcnt_watch_event_data_t *edata,
+                                                void *user_ctx) {
+  auto *self = static_cast<PulseMeterSensor *>(user_ctx);
+  if (self == nullptr || edata == nullptr)
+    return false;
+
+  const int16_t watch_point = static_cast<int16_t>(edata->watch_point_value);
+  if (watch_point != PCNT_HIGH_LIMIT)
+    return false;
+
+  // PCNT has already filtered the input in hardware. Reset its one-edge
+  // watchpoint immediately, then hand the event to the normal pulse_meter
+  // double buffer so loop() can publish with the same cadence as GPIO ISR.
+  (void) pcnt_unit_clear_count(unit);
+  const uint32_t now = micros();
+  auto &set = *self->set_;
+  set.last_detected_edge_us_ = now;
+  set.last_rising_edge_us_ = now;
+  set.count_ = set.count_ + 1;
+  self->new_event_ = true;
+  return false;
+}
+
+void PulseMeterSensor::teardown_pcnt_() {
+  if (this->pcnt_unit_ != nullptr)
+    (void) pcnt_unit_stop(this->pcnt_unit_);
+  if (this->pcnt_channel_ != nullptr) {
+    (void) pcnt_del_channel(this->pcnt_channel_);
+    this->pcnt_channel_ = nullptr;
+  }
+  if (this->pcnt_unit_ != nullptr) {
+    (void) pcnt_unit_disable(this->pcnt_unit_);
+    (void) pcnt_del_unit(this->pcnt_unit_);
+    this->pcnt_unit_ = nullptr;
+  }
+  this->use_pcnt_ = false;
+}
+
+bool PulseMeterSensor::setup_pcnt_() {
+  if (this->filter_mode_ != FILTER_EDGE)
+    return false;
+
+  pcnt_unit_config_t unit_cfg{};
+  unit_cfg.low_limit = -1;
+  unit_cfg.high_limit = PCNT_HIGH_LIMIT;
+  if (pcnt_new_unit(&unit_cfg, &this->pcnt_unit_) != ESP_OK || this->pcnt_unit_ == nullptr) {
+    this->teardown_pcnt_();
+    return false;
+  }
+
+  pcnt_chan_config_t channel_cfg{};
+  channel_cfg.edge_gpio_num = this->pin_->get_pin();
+  channel_cfg.level_gpio_num = -1;
+  if (pcnt_new_channel(this->pcnt_unit_, &channel_cfg, &this->pcnt_channel_) != ESP_OK ||
+      this->pcnt_channel_ == nullptr) {
+    this->teardown_pcnt_();
+    return false;
+  }
+
+  if (pcnt_channel_set_edge_action(this->pcnt_channel_, PCNT_CHANNEL_EDGE_ACTION_INCREASE,
+                                   PCNT_CHANNEL_EDGE_ACTION_HOLD) != ESP_OK ||
+      pcnt_channel_set_level_action(this->pcnt_channel_, PCNT_CHANNEL_LEVEL_ACTION_KEEP,
+                                    PCNT_CHANNEL_LEVEL_ACTION_KEEP) != ESP_OK) {
+    this->teardown_pcnt_();
+    return false;
+  }
+
+  if (this->filter_us_ > 0) {
+    const uint32_t applied_filter_us = this->filter_us_ > PCNT_MAX_GLITCH_FILTER_US
+                                           ? PCNT_MAX_GLITCH_FILTER_US
+                                           : this->filter_us_;
+    pcnt_glitch_filter_config_t filter_cfg{};
+    filter_cfg.max_glitch_ns = applied_filter_us * 1000U;
+    if (pcnt_unit_set_glitch_filter(this->pcnt_unit_, &filter_cfg) != ESP_OK) {
+      this->teardown_pcnt_();
+      return false;
+    }
+    if (applied_filter_us != this->filter_us_) {
+      ESP_LOGW(TAG, "PCNT internal filter clamped from %" PRIu32 "us to %" PRIu32 "us", this->filter_us_,
+               applied_filter_us);
+    }
+  }
+
+  pcnt_event_callbacks_t callbacks{};
+  callbacks.on_reach = &PulseMeterSensor::pcnt_on_reach_;
+  if (pcnt_unit_register_event_callbacks(this->pcnt_unit_, &callbacks, this) != ESP_OK ||
+      pcnt_unit_add_watch_point(this->pcnt_unit_, PCNT_HIGH_LIMIT) != ESP_OK ||
+      pcnt_unit_enable(this->pcnt_unit_) != ESP_OK || pcnt_unit_clear_count(this->pcnt_unit_) != ESP_OK ||
+      pcnt_unit_start(this->pcnt_unit_) != ESP_OK) {
+    this->teardown_pcnt_();
+    return false;
+  }
+
+  this->use_pcnt_ = true;
+  return true;
+}
+#endif
+
 void PulseMeterSensor::set_total_pulses(uint32_t pulses) {
   this->total_pulses_ = pulses;
   if (this->total_sensor_ != nullptr) {
@@ -68,11 +167,19 @@ void PulseMeterSensor::setup() {
     this->update_hysteresis_defaults_();
   }
 
+#if ESPHOME_PULSE_METER_HAS_PCNT
+  if (this->filter_mode_ == FILTER_EDGE) {
+    if (!this->setup_pcnt_()) {
+      ESP_LOGW(TAG, "PCNT backend unavailable; falling back to GPIO interrupts");
+    }
+  }
+#endif
+
 #if defined(ESP_IDF_VERSION) && __has_include("driver/gpio_filter.h")
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5)
 #if defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32C3) || \
     defined(CONFIG_IDF_TARGET_ESP32C6)
-  {
+  if (!this->use_pcnt_) {
     // ESP32-S3: "pin glitch filter" nemá konfigurovatelný časový práh.
     if (this->filter_us_ > 0) {
       gpio_pin_glitch_filter_config_t cfg{};
@@ -142,7 +249,7 @@ void PulseMeterSensor::setup() {
   }
 #endif
 
-  if (!this->use_rmt_) {
+  if (!this->use_rmt_ && !this->use_pcnt_) {
 #if (defined(portNUM_PROCESSORS) && (portNUM_PROCESSORS > 1))
     xTaskCreatePinnedToCore(PulseMeterSensor::attach_isr_task_, "pm_attach_isr", 2048, this, 20, nullptr, 1);
 #else
@@ -169,8 +276,12 @@ void PulseMeterSensor::loop() {
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
   bool use_rmt = this->use_rmt_;
 #endif
-
   if (LIKELY(!this->new_event_) && LIKELY(time_before_(now, this->next_timeout_check_us_))) {
+#if ESPHOME_PULSE_METER_HAS_PCNT
+    if (this->use_pcnt_) {
+      return;
+    } else
+#endif
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
     if (use_rmt) {
       if (!__atomic_load_n(&this->rmt_pending_, __ATOMIC_ACQUIRE) && this->rmt_recv_count_ == 0) {
@@ -431,8 +542,13 @@ void PulseMeterSensor::dump_config() {
   LOG_PIN("  Pin: ", this->pin_);
   if (this->filter_mode_ == FILTER_EDGE) {
     ESP_LOGCONFIG(TAG, "  Filtering rising edges less than %" PRIu32 " us apart", this->filter_us_);
-    ESP_LOGCONFIG(TAG, "  ISR coalescing (EDGE): %s, window >= %" PRIu32 " us",
-                  this->coalesce_enabled_edge_ ? "on" : "off", this->coalesce_min_us_);
+    if (this->use_pcnt_) {
+      ESP_LOGCONFIG(TAG, "  PCNT backend: enabled (hardware glitch filter)");
+    } else {
+      ESP_LOGCONFIG(TAG, "  PCNT backend: not available; using GPIO ISR");
+      ESP_LOGCONFIG(TAG, "  ISR coalescing (EDGE): %s, window >= %" PRIu32 " us",
+                    this->coalesce_enabled_edge_ ? "on" : "off", this->coalesce_min_us_);
+    }
   } else {
     ESP_LOGCONFIG(TAG, "  Filtering pulses shorter than %" PRIu32 " us (low>=%" PRIu32 " us, high>=%" PRIu32 " us)",
                   this->filter_us_, this->min_low_us_, this->min_high_us_);

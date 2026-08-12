@@ -20,6 +20,18 @@
 #include "driver/rmt_rx.h"
 #endif
 
+#if defined(USE_ESP32) && __has_include("soc/soc_caps.h")
+#include "soc/soc_caps.h"
+#endif
+
+#if defined(USE_ESP32) && defined(SOC_PCNT_SUPPORTED) && SOC_PCNT_SUPPORTED && __has_include("driver/pulse_cnt.h")
+#include "driver/pulse_cnt.h"
+#include "esp_err.h"
+#define ESPHOME_PULSE_METER_HAS_PCNT 1
+#else
+#define ESPHOME_PULSE_METER_HAS_PCNT 0
+#endif
+
 #if __has_include("freertos/FreeRTOS.h")
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -74,6 +86,13 @@ class PulseMeterSensor : public sensor::Sensor, public Component {
   static void IRAM_ATTR edge_intr(PulseMeterSensor *sensor);
   static void IRAM_ATTR pulse_intr(PulseMeterSensor *sensor);
   static void IRAM_ATTR pulse_intr_sample_(PulseMeterSensor *sensor, uint32_t now, bool pin_val);
+
+#if ESPHOME_PULSE_METER_HAS_PCNT
+  static bool IRAM_ATTR pcnt_on_reach_(pcnt_unit_handle_t unit, const pcnt_watch_event_data_t *edata,
+                                       void *user_ctx);
+  bool setup_pcnt_();
+  void teardown_pcnt_();
+#endif
 
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5) && __has_include("driver/rmt_rx.h")
   static bool IRAM_ATTR rmt_rx_done_cb_(rmt_channel_handle_t channel, const rmt_rx_done_event_data_t *edata,
@@ -205,6 +224,15 @@ class PulseMeterSensor : public sensor::Sensor, public Component {
   uint32_t coalesce_min_us_{0};
 
   bool use_rmt_{false};
+  bool use_pcnt_{false};
+
+#if ESPHOME_PULSE_METER_HAS_PCNT
+  static constexpr int16_t PCNT_HIGH_LIMIT = 1;
+  static constexpr uint32_t PCNT_MAX_GLITCH_FILTER_US = 13;
+
+  pcnt_unit_handle_t pcnt_unit_{nullptr};
+  pcnt_channel_handle_t pcnt_channel_{nullptr};
+#endif
 
 #if defined(ESP_IDF_VERSION) && __has_include("driver/gpio_filter.h")
   gpio_glitch_filter_handle_t glitch_filter_{nullptr};
