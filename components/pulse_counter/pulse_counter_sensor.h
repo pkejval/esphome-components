@@ -121,6 +121,13 @@ struct BasicPulseCounterStorage : public PulseCounterStorageBase {
   std::atomic<int32_t> counter_{0};
   std::atomic<int32_t> last_read_{0};
 
+  // These values are derived once during setup so the ISR does not need a
+  // switch statement for every edge. A non-zero single_edge_delta_ also means
+  // that only one edge is enabled (only valid without the software filter).
+  int32_t rising_delta_{1};
+  int32_t falling_delta_{0};
+  int32_t single_edge_delta_{0};
+
   volatile uint32_t last_edge_ticks_{0};
   uint32_t filter_ticks_{0};
 };

@@ -14,6 +14,17 @@ namespace pulse_counter {
 static const char *const TAG = "pulse_counter";
 static const char *const EDGE_MODE_TO_STRING[] = {"DISABLE", "INCREMENT", "DECREMENT"};
 
+static int32_t count_mode_to_delta(PulseCounterCountMode mode) {
+  switch (mode) {
+    case PULSE_COUNTER_INCREMENT:
+      return 1;
+    case PULSE_COUNTER_DECREMENT:
+      return -1;
+    default:
+      return 0;
+  }
+}
+
 std::unique_ptr<PulseCounterStorageBase> get_storage(bool hw_pcnt) {
 #ifdef HAS_PCNT
   if (hw_pcnt)
@@ -43,19 +54,17 @@ void IRAM_ATTR BasicPulseCounterStorage::gpio_intr(BasicPulseCounterStorage *arg
   // Accept this edge: update baseline time/ticks.
   arg->last_edge_ticks_ = now;
 
-  const bool level = arg->isr_pin_.digital_read();
-  const PulseCounterCountMode mode = level ? arg->rising_edge_mode : arg->falling_edge_mode;
-
-  switch (mode) {
-    case PULSE_COUNTER_DISABLE:
-      break;
-    case PULSE_COUNTER_INCREMENT:
-      arg->counter_.fetch_add(1, std::memory_order_relaxed);
-      break;
-    case PULSE_COUNTER_DECREMENT:
-      arg->counter_.fetch_sub(1, std::memory_order_relaxed);
-      break;
+  int32_t delta = arg->single_edge_delta_;
+  if (delta == 0) {
+    // Equal actions do not need a GPIO register read. Otherwise, determine
+    // the edge from the pin level as before.
+    delta = arg->rising_delta_;
+    if (delta != arg->falling_delta_)
+      delta = arg->isr_pin_.digital_read() ? delta : arg->falling_delta_;
   }
+
+  if (delta != 0)
+    arg->counter_.fetch_add(delta, std::memory_order_relaxed);
 }
 
 bool BasicPulseCounterStorage::pulse_counter_setup(InternalGPIOPin *pin) {
@@ -65,6 +74,9 @@ bool BasicPulseCounterStorage::pulse_counter_setup(InternalGPIOPin *pin) {
 
   this->counter_.store(0, std::memory_order_relaxed);
   this->last_read_.store(0, std::memory_order_relaxed);
+  this->rising_delta_ = count_mode_to_delta(this->rising_edge_mode);
+  this->falling_delta_ = count_mode_to_delta(this->falling_edge_mode);
+  this->single_edge_delta_ = 0;
 
 #if defined(USE_ESP32)
   const uint32_t cpu_hz = BasicPulseCounterStorage::cpu_freq_hz_();
@@ -78,14 +90,27 @@ bool BasicPulseCounterStorage::pulse_counter_setup(InternalGPIOPin *pin) {
   // Baseline set to 0 so first accepted edge always arms the filter correctly.
   this->last_edge_ticks_ = 0;
 
-  this->pin->attach_interrupt(BasicPulseCounterStorage::gpio_intr, this, gpio::INTERRUPT_ANY_EDGE);
+  // With no software filter, observing only the counted edge is exactly
+  // equivalent and halves the ISR rate for the common single-edge modes.
+  if (this->filter_ticks_ == 0 && this->rising_delta_ != 0 && this->falling_delta_ == 0) {
+    this->single_edge_delta_ = this->rising_delta_;
+    this->pin->attach_interrupt(BasicPulseCounterStorage::gpio_intr, this, gpio::INTERRUPT_RISING_EDGE);
+  } else if (this->filter_ticks_ == 0 && this->falling_delta_ != 0 && this->rising_delta_ == 0) {
+    this->single_edge_delta_ = this->falling_delta_;
+    this->pin->attach_interrupt(BasicPulseCounterStorage::gpio_intr, this, gpio::INTERRUPT_FALLING_EDGE);
+  } else {
+    this->pin->attach_interrupt(BasicPulseCounterStorage::gpio_intr, this, gpio::INTERRUPT_ANY_EDGE);
+  }
   return true;
 }
 
 pulse_counter_t BasicPulseCounterStorage::read_delta() {
   const int32_t cur = this->counter_.load(std::memory_order_relaxed);
   const int32_t prev = this->last_read_.exchange(cur, std::memory_order_acq_rel);
-  return static_cast<pulse_counter_t>(cur - prev);
+  // Unsigned subtraction gives the intended modulo-2^32 delta across a
+  // counter wrap without relying on signed-overflow behaviour.
+  const uint32_t delta = static_cast<uint32_t>(cur) - static_cast<uint32_t>(prev);
+  return static_cast<pulse_counter_t>(delta);
 }
 
 int64_t BasicPulseCounterStorage::read_total() {
@@ -125,7 +150,9 @@ bool HwPulseCounterStorage::on_pcnt_reach_(pcnt_unit_handle_t unit, const pcnt_w
   (void) pcnt_unit_clear_count(unit);
 
   self->seq_.fetch_add(1, std::memory_order_acq_rel);
-  return true;
+  // true is reserved for callbacks that woke a higher-priority FreeRTOS task.
+  // This callback only updates the PCNT accumulator.
+  return false;
 }
 
 bool HwPulseCounterStorage::configure_glitch_filter_() {
@@ -459,29 +486,40 @@ void PulseCounterSensor::timer_callback(void *arg) {
   const uint64_t t = static_cast<uint64_t>(esp_timer_get_time());
 
   const pulse_counter_t delta = self->storage_->read_delta();
+  bool publish_pending = false;
 
   if (self->last_tick_us_ == 0) {
     self->last_tick_us_ = t;
-    if (delta != 0)
+    if (delta != 0 && self->total_sensor_ != nullptr) {
       self->pending_total_delta_.fetch_add(static_cast<int64_t>(delta), std::memory_order_relaxed);
+      self->enable_loop_soon_any_context();
+    }
     return;
   }
 
   const uint64_t dt_us = t - self->last_tick_us_;
   self->last_tick_us_ = t;
 
-  if (delta != 0)
+  if (delta != 0 && self->total_sensor_ != nullptr) {
     self->pending_total_delta_.fetch_add(static_cast<int64_t>(delta), std::memory_order_relaxed);
+    publish_pending = true;
+  }
 
-  if (dt_us == 0)
+  if (dt_us == 0) {
+    if (publish_pending)
+      self->enable_loop_soon_any_context();
     return;
+  }
 
   if (self->fixed_time_window_) {
     const double ppm = (static_cast<double>(delta) * 60000000.0) / static_cast<double>(dt_us);
     if (std::isfinite(ppm) && std::fabs(ppm) < 1e9) {
       self->last_calculated_ppm_.store(static_cast<float>(ppm), std::memory_order_relaxed);
       self->new_value_ready_.store(true, std::memory_order_release);
+      publish_pending = true;
     }
+    if (publish_pending)
+      self->enable_loop_soon_any_context();
     return;
   }
 
@@ -501,10 +539,14 @@ void PulseCounterSensor::timer_callback(void *arg) {
       if (std::isfinite(ppm) && std::fabs(ppm) < 1e9) {
         self->last_calculated_ppm_.store(static_cast<float>(ppm), std::memory_order_relaxed);
         self->new_value_ready_.store(true, std::memory_order_release);
+        publish_pending = true;
       }
     }
     self->reset_accumulation_();
   }
+
+  if (publish_pending)
+    self->enable_loop_soon_any_context();
 }
 #endif
 
@@ -512,6 +554,9 @@ void PulseCounterSensor::loop() {
 #if defined(USE_ESP32)
   this->process_pending_();
 #endif
+  // The ESP32 timer enables this loop only when there is a value to publish;
+  // other platforms publish from PollingComponent::update().
+  this->disable_loop();
 }
 
 #if defined(USE_ESP32)

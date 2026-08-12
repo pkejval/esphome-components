@@ -24,8 +24,9 @@ CONF_USE_PCNT = "use_pcnt"
 CONF_MIN_PULSES_PER_CALC = "min_pulses_per_calc"
 CONF_MAX_ACCUMULATION = "max_accumulation"
 
-LEGACY_ESP32_PCNT_FILTER_LIMIT_US = 12.0   # ESP32 a ESP32-S2
-MODERN_ESP32_PCNT_FILTER_LIMIT_US = 819.0  # ESP32-S3, C3, C6, H2
+# PCNT's hardware glitch-filter threshold is limited to approximately 13 us
+# on ESP32 targets. Longer debounce periods require the software backend.
+ESP32_PCNT_FILTER_LIMIT_US = 13.0
 
 _CONF_INTERNAL_FILTER_CLAMPED_US = "_internal_filter_clamped_us"
 
@@ -48,11 +49,6 @@ SetTotalPulsesAction = pulse_counter_ns.class_(
 )
 
 
-def _get_esp32_variant():
-    esp32_data = CORE.data.get("esp32", {})
-    return esp32_data.get("variant", "ESP32")
-
-
 def validate_internal_filter(config):
     use_pcnt = config.get(CONF_USE_PCNT)
     if not use_pcnt:
@@ -63,12 +59,9 @@ def validate_internal_filter(config):
 
     if CORE.is_esp32:
         filter_us = float(config[CONF_INTERNAL_FILTER].total_microseconds)
-        variant = _get_esp32_variant()
-        is_legacy = variant in ("ESP32", "ESP32S2")
-        limit = LEGACY_ESP32_PCNT_FILTER_LIMIT_US if is_legacy else MODERN_ESP32_PCNT_FILTER_LIMIT_US
-
-        # Clamp to HW limit (ESP32, ESP32-S2)
-        clamped = min(filter_us, limit)
+        # Keep the generated value aligned with the runtime PCNT limit. This
+        # prevents configuration and the effective hardware filter diverging.
+        clamped = min(filter_us, ESP32_PCNT_FILTER_LIMIT_US)
         config[_CONF_INTERNAL_FILTER_CLAMPED_US] = clamped
 
     return config
