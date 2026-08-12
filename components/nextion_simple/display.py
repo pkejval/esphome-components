@@ -47,6 +47,10 @@ CONF_ON_SETUP = "on_setup"
 CONF_ON_PAGE = "on_page"
 CONF_ON_NEXTION_READY = "on_nextion_ready"
 CONF_NEXTION_READY_COOLDOWN = "nextion_ready_cooldown"
+CONF_TX_MAX_PER_LOOP = "tx_max_per_loop"
+CONF_TX_MAX_BYTES_PER_LOOP = "tx_max_bytes_per_loop"
+CONF_TX_TIME_BUDGET_US = "tx_time_budget_us"
+CONF_LOOP_TIME_BUDGET_US = "loop_time_budget_us"
 
 CONF_PAGE = "page"
 CONF_COMPONENT = "component"
@@ -79,6 +83,10 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(
             CONF_NEXTION_READY_COOLDOWN, default="500ms"
         ): cv.positive_time_period_milliseconds,
+        cv.Optional(CONF_TX_MAX_PER_LOOP): cv.int_range(min=1, max=32),
+        cv.Optional(CONF_TX_MAX_BYTES_PER_LOOP): cv.int_range(min=16, max=4096),
+        cv.Optional(CONF_TX_TIME_BUDGET_US): cv.int_range(min=100, max=10000),
+        cv.Optional(CONF_LOOP_TIME_BUDGET_US): cv.int_range(min=100, max=10000),
     }
 )
 
@@ -99,6 +107,14 @@ async def to_code(config):
                 int(config["nextion_ready_cooldown"].total_milliseconds)
             )
         )
+    if CONF_TX_MAX_PER_LOOP in config:
+        cg.add(var.set_tx_max_per_loop(config[CONF_TX_MAX_PER_LOOP]))
+    if CONF_TX_MAX_BYTES_PER_LOOP in config:
+        cg.add(var.set_tx_max_bytes_per_loop(config[CONF_TX_MAX_BYTES_PER_LOOP]))
+    if CONF_TX_TIME_BUDGET_US in config:
+        cg.add(var.set_tx_time_budget_us(config[CONF_TX_TIME_BUDGET_US]))
+    if CONF_LOOP_TIME_BUDGET_US in config:
+        cg.add(var.set_loop_time_budget_us(config[CONF_LOOP_TIME_BUDGET_US]))
 
     if "on_setup" in config:
         for conf in config["on_setup"]:

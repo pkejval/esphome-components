@@ -10,8 +10,10 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace esphome {
@@ -29,18 +31,35 @@ class NextionSimple : public Component {
   void set_uart_parent(uart::UARTComponent *parent) { this->uart_parent_ = parent; }
   void set_tft_url(const std::string &tft_url) { this->tft_url_ = tft_url; }
   void set_nextion_ready_cooldown(uint32_t cooldown) { nextion_ready_cooldown_ = cooldown; }
+  // Limit the work done by a single component loop iteration.  These are
+  // deliberately independent of UART baud rate: the UART continues sending
+  // in the background after write_array() returns.
+  void set_tx_max_per_loop(uint8_t max_per_loop) { this->tx_max_per_loop_ = max_per_loop; }
+  void set_tx_max_bytes_per_loop(uint16_t max_bytes) { this->tx_max_bytes_per_loop_ = max_bytes; }
+  void set_tx_time_budget_us(uint32_t budget_us) { this->tx_time_budget_us_ = budget_us; }
+  void set_loop_time_budget_us(uint32_t budget_us) { this->loop_time_budget_us_ = budget_us; }
 
   // High-level API
+  void set_component_value(const char *component_name, float value);
   void set_component_value(const std::string &component_name, float value);
+  void set_component_text(const char *component_name, const char *text);
+  void set_component_text(const char *component_name, const std::string &text);
   void set_component_text(const std::string &component_name, const std::string &text,
                           const std::vector<std::string> &args = {});
+  void set_component_text_printf(const char *component_name, const char *format, ...);
   void set_component_text_printf(const std::string &component_name, const char *format, ...);
+  void set_component_picc(const char *component_name, int value);
   void set_component_picc(const std::string &component_name, int value);
+  void set_component_picc1(const char *component_name, int value);
   void set_component_picc1(const std::string &component_name, int value);
+  void set_component_background_color(const char *component_name, int color);
   void set_component_background_color(const std::string &component_name, int color);
+  void set_component_font_color(const char *component_name, int color);
   void set_component_background_color(const std::string &component_name, Color color);
   void set_component_font_color(const std::string &component_name, int color);
   void set_component_font_color(const std::string &component_name, Color color);
+  void set_component_visibility(const char *component_name, bool state);
+  void set_component_visibility(const char *component_name, int state);
   void set_component_visibility(const std::string &component_name, bool state);
   void set_component_visibility(const std::string &component_name, int state);
   void set_page(int page);
@@ -80,17 +99,17 @@ class NextionSimple : public Component {
   void start_init_handshake_();
   void enter_writeonly_mode_();
   void request_health_check_();
-  void init_tick_();
-  void diagnostic_tick_();
+  void init_tick_(uint32_t loop_deadline_us);
+  void diagnostic_tick_(uint32_t loop_deadline_us);
 
   // ===== RX =====
-  void drain_uart_into_ring_();
+  void drain_uart_into_ring_(uint32_t loop_deadline_us);
   void reset_rx_state_();
 
   enum class RxFilter : uint8_t { INIT_ONLY, DIAG_ONLY };
-  bool parse_from_ring_(RxFilter filter);
+  bool parse_from_ring_(RxFilter filter, uint32_t loop_deadline_us);
   void handle_frame_(RxFilter filter, const uint8_t *frame, size_t len_no_term);
-  bool rb_find_next_frame_start_(RxFilter filter, uint8_t &b, uint32_t start_us, uint8_t &parse_iters);
+  bool rb_find_next_frame_start_(RxFilter filter, uint8_t &b, uint32_t deadline_us, uint8_t &parse_iters);
 
   void log_rx_drops_if_needed_();
 
@@ -146,6 +165,7 @@ class NextionSimple : public Component {
   struct TxMirrorEntry {
     bool used{false};
     bool dirty{false};
+    bool overflow_storage{false};
     uint32_t key{0};
     uint32_t epoch{0};
     TxMirrorKind kind{TxMirrorKind::NONE};
@@ -155,46 +175,60 @@ class NextionSimple : public Component {
     std::string text;
     uint8_t cmd_buf[kMaxCmd + 3]{};
     int int_value{0};
+    TxMirrorEntry *dirty_prev{nullptr};
+    TxMirrorEntry *dirty_next{nullptr};
   };
 
-  void txq_prune_tombstones_();
-  bool txq_has_raw_() const { return this->txq_head_ != this->txq_tail_; }
-  size_t txq_count_() const { return (this->txq_head_ - this->txq_tail_) & (TXQ_SIZE - 1); }
-  bool txq_near_full_() const { return this->txq_count_() >= (TXQ_SIZE - (TXQ_SIZE / 4)); }
-
+  bool txq_has_raw_() const { return this->txq_head_ != this->txq_tail_ || !this->txq_overflow_.empty(); }
   bool txq_push_raw_barrier_(const uint8_t *data, size_t len);
-  bool txq_pop_(TxEntry &out);
-  void txq_log_overflow_if_needed_();
-  void tx_flush_();
+  const TxEntry *txq_peek_();
+  void txq_consume_();
+  void tx_flush_(uint32_t loop_deadline_us = 0);
 
-  TxMirrorEntry *txm_find_or_alloc_(uint32_t key);
+  TxMirrorEntry *txm_find_or_alloc_(uint32_t key, const char *component_name, TxMirrorKind kind);
+  void txm_reuse_(TxMirrorEntry &entry, uint32_t key, bool overflow_storage);
+  void txm_cache_(TxMirrorEntry &entry);
+  void txm_mark_dirty_(TxMirrorEntry &entry, bool move_to_tail);
+  void txm_clear_dirty_(TxMirrorEntry &entry);
+  bool txm_has_dirty_() const { return this->dirty_head_ != nullptr; }
   bool txm_build_command_(TxMirrorEntry &e);
-  bool txm_set_prop_int_(const std::string &component_name, const char *prop, TxCoalesceKind kind, int value);
-  bool txm_set_vis_(const std::string &component_name, int state);
-  bool txm_set_text_(const std::string &component_name, const char *text);
+  bool txm_set_prop_int_(const char *component_name, const char *prop, TxCoalesceKind kind, int value);
+  bool txm_set_vis_(const char *component_name, int state);
+  bool txm_set_text_(const char *component_name, const char *text);
 
   #if defined(USE_ESP32)
   uint8_t tx_max_per_loop_{6};
-  uint32_t tx_time_budget_us_{3000};
+  uint16_t tx_max_bytes_per_loop_{512};
+  uint32_t tx_time_budget_us_{2000};
+  uint32_t loop_time_budget_us_{2500};
   #else
   uint8_t tx_max_per_loop_{3};
-  uint32_t tx_time_budget_us_{1500};
+  uint16_t tx_max_bytes_per_loop_{256};
+  uint32_t tx_time_budget_us_{1000};
+  uint32_t loop_time_budget_us_{1500};
   #endif
 
   TxEntry txq_[TXQ_SIZE]{};
   size_t txq_head_{0};
   size_t txq_tail_{0};
+  // Allocation-free storage covers the normal case. The overflow queue is
+  // used only for a burst that exceeds it, rather than silently losing raw
+  // commands.
+  std::deque<TxEntry> txq_overflow_;
   TxMirrorEntry txm_[TX_MIRROR_SIZE]{};
+  // Same policy for coalesced state: never evict a dirty component merely
+  // because all fixed mirror slots are busy.
+  std::deque<TxMirrorEntry> txm_overflow_;
 
-  uint64_t dirty_mask_{0};
+  TxMirrorEntry *dirty_head_{nullptr};
+  TxMirrorEntry *dirty_tail_{nullptr};
+
+  static constexpr size_t TXM_LOOKUP_CACHE_SIZE = 8;
+  TxMirrorEntry *txm_lookup_cache_[TXM_LOOKUP_CACHE_SIZE]{};
+  uint8_t txm_lookup_cache_next_{0};
   uint32_t uart_clear_micros_{0};
 
   uint32_t tx_epoch_{1};
-
-  bool txq_overflow_{false};
-  uint32_t txq_overflow_last_log_ms_{0};
-  uint32_t txq_overflow_log_interval_ms_{1000};
-  uint32_t txq_drop_count_{0};
 
   // ===== TX (builders) =====
   void tx_begin_();
@@ -208,9 +242,9 @@ class NextionSimple : public Component {
   bool tx_append_escaped_nextion_string_(const char *s);
   bool tx_append_escaped_nextion_string_(const std::string &s);
 
-  void send_prop_int_(const std::string &component_name, const char *prop, TxCoalesceKind kind, int value);
-  void send_vis_(const std::string &component_name, int state);
-  void send_set_text_(const std::string &component_name, const char *text);
+  void send_prop_int_(const char *component_name, const char *prop, TxCoalesceKind kind, int value);
+  void send_vis_(const char *component_name, int state);
+  void send_set_text_(const char *component_name, const char *text);
   void send_set_text_formatted_(const std::string &component_name, const std::string &fmt,
                                 const std::vector<std::string> &args);
 
