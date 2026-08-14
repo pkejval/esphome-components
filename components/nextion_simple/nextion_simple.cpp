@@ -115,7 +115,7 @@ void NextionSimple::reset_rx_state_() {
 }
 
 static inline bool is_init_start(uint8_t b) { return b == 0x66 || b == 0x88 || b == 0x00; }
-static inline bool is_diag_start(uint8_t b) { return b == 0x70 || b == 0x71; }
+static inline bool is_diag_start(uint8_t b) { return b == 0x66 || b == 0x70 || b == 0x71; }
 
 bool NextionSimple::rb_find_next_frame_start_(RxFilter filter, uint8_t &b, uint32_t deadline_us, uint8_t &parse_iters) {
   const size_t mask = RB_SIZE - 1;

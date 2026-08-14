@@ -17,13 +17,14 @@ bool IRAM_ATTR PulseMeterSensor::pcnt_on_reach_(pcnt_unit_handle_t unit, const p
     return false;
 
   const int16_t watch_point = static_cast<int16_t>(edata->watch_point_value);
-  if (watch_point != PCNT_HIGH_LIMIT)
+  if (watch_point != PCNT_EDGE_WATCH_POINT)
     return false;
 
   // PCNT has already filtered the input in hardware. Reset its one-edge
   // watchpoint immediately, then hand the event to the normal pulse_meter
   // double buffer so loop() can publish with the same cadence as GPIO ISR.
-  (void) pcnt_unit_clear_count(unit);
+  if (pcnt_unit_clear_count(unit) != ESP_OK)
+    return false;
   const uint32_t now = micros();
   auto &set = *self->set_;
   set.last_detected_edge_us_ = now;
@@ -53,7 +54,7 @@ bool PulseMeterSensor::setup_pcnt_() {
     return false;
 
   pcnt_unit_config_t unit_cfg{};
-  unit_cfg.low_limit = -1;
+  unit_cfg.low_limit = PCNT_LOW_LIMIT;
   unit_cfg.high_limit = PCNT_HIGH_LIMIT;
   if (pcnt_new_unit(&unit_cfg, &this->pcnt_unit_) != ESP_OK || this->pcnt_unit_ == nullptr) {
     this->teardown_pcnt_();
@@ -96,7 +97,7 @@ bool PulseMeterSensor::setup_pcnt_() {
   pcnt_event_callbacks_t callbacks{};
   callbacks.on_reach = &PulseMeterSensor::pcnt_on_reach_;
   if (pcnt_unit_register_event_callbacks(this->pcnt_unit_, &callbacks, this) != ESP_OK ||
-      pcnt_unit_add_watch_point(this->pcnt_unit_, PCNT_HIGH_LIMIT) != ESP_OK ||
+      pcnt_unit_add_watch_point(this->pcnt_unit_, PCNT_EDGE_WATCH_POINT) != ESP_OK ||
       pcnt_unit_enable(this->pcnt_unit_) != ESP_OK || pcnt_unit_clear_count(this->pcnt_unit_) != ESP_OK ||
       pcnt_unit_start(this->pcnt_unit_) != ESP_OK) {
     this->teardown_pcnt_();

@@ -227,7 +227,9 @@ class PulseMeterSensor : public sensor::Sensor, public Component {
   bool use_pcnt_{false};
 
 #if ESPHOME_PULSE_METER_HAS_PCNT
-  static constexpr int16_t PCNT_HIGH_LIMIT = 1;
+  static constexpr int16_t PCNT_LOW_LIMIT = -30000;
+  static constexpr int16_t PCNT_HIGH_LIMIT = 30000;
+  static constexpr int16_t PCNT_EDGE_WATCH_POINT = 1;
   static constexpr uint32_t PCNT_MAX_GLITCH_FILTER_US = 13;
 
   pcnt_unit_handle_t pcnt_unit_{nullptr};
