@@ -51,6 +51,8 @@ CONF_TX_MAX_PER_LOOP = "tx_max_per_loop"
 CONF_TX_MAX_BYTES_PER_LOOP = "tx_max_bytes_per_loop"
 CONF_TX_TIME_BUDGET_US = "tx_time_budget_us"
 CONF_LOOP_TIME_BUDGET_US = "loop_time_budget_us"
+CONF_RESYNC_INTERVAL = "resync_interval"
+CONF_HEALTH_CHECK_INTERVAL = "health_check_interval"
 
 CONF_PAGE = "page"
 CONF_COMPONENT = "component"
@@ -87,6 +89,12 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_TX_MAX_BYTES_PER_LOOP): cv.int_range(min=16, max=4096),
         cv.Optional(CONF_TX_TIME_BUDGET_US): cv.int_range(min=100, max=10000),
         cv.Optional(CONF_LOOP_TIME_BUDGET_US): cv.int_range(min=100, max=10000),
+        cv.Optional(
+            CONF_RESYNC_INTERVAL, default="30s"
+        ): cv.positive_time_period_milliseconds,
+        cv.Optional(
+            CONF_HEALTH_CHECK_INTERVAL, default="15s"
+        ): cv.positive_time_period_milliseconds,
     }
 )
 
@@ -115,6 +123,14 @@ async def to_code(config):
         cg.add(var.set_tx_time_budget_us(config[CONF_TX_TIME_BUDGET_US]))
     if CONF_LOOP_TIME_BUDGET_US in config:
         cg.add(var.set_loop_time_budget_us(config[CONF_LOOP_TIME_BUDGET_US]))
+    cg.add(
+        var.set_resync_interval_ms(int(config[CONF_RESYNC_INTERVAL].total_milliseconds))
+    )
+    cg.add(
+        var.set_health_check_interval_ms(
+            int(config[CONF_HEALTH_CHECK_INTERVAL].total_milliseconds)
+        )
+    )
 
     if "on_setup" in config:
         for conf in config["on_setup"]:

@@ -53,6 +53,8 @@ void NextionSimple::dump_config() {
   ESP_LOGCONFIG(TAG, "  TX batching: queue=%u, max_per_loop=%u, budget=%" PRIu32 "us, loop budget=%" PRIu32 "us",
                  static_cast<unsigned>(TXQ_SIZE), static_cast<unsigned>(this->tx_max_per_loop_),
                  static_cast<uint32_t>(this->tx_time_budget_us_), static_cast<uint32_t>(this->loop_time_budget_us_));
+  ESP_LOGCONFIG(TAG, "  Resync interval: %" PRIu32 "ms", static_cast<uint32_t>(this->resync_interval_ms_));
+  ESP_LOGCONFIG(TAG, "  Health check interval: %" PRIu32 "ms", static_cast<uint32_t>(this->health_check_interval_ms_));
 }
 
 void NextionSimple::setup() {
@@ -70,6 +72,29 @@ void NextionSimple::setup() {
 void NextionSimple::loop() {
   if (this->uart_parent_ == nullptr)
     return;
+
+  if (this->upload_active_prev_ && !this->upload_in_progress_ && this->pending_page_sync_) {
+    this->pending_page_sync_ = false;
+    this->set_page_verified(this->pending_page_sync_page_, this->pending_page_sync_retries_,
+                             this->pending_page_sync_timeout_ms_);
+  }
+  this->upload_active_prev_ = this->upload_in_progress_;
+
+  if (!this->upload_in_progress_ && this->mode_ == NxMode::RUN_WRITEONLY && this->resync_interval_ms_ != 0) {
+    const uint32_t now_ms = millis();
+    if (now_ms - this->last_resync_ms_ >= this->resync_interval_ms_) {
+      this->last_resync_ms_ = now_ms;
+      this->resync_tick_();
+    }
+  }
+
+  if (!this->upload_in_progress_ && this->mode_ == NxMode::RUN_WRITEONLY && this->health_check_interval_ms_ != 0) {
+    const uint32_t now_ms = millis();
+    if (now_ms - this->last_health_check_ms_ >= this->health_check_interval_ms_) {
+      this->last_health_check_ms_ = now_ms;
+      this->request_health_check_();
+    }
+  }
 
   // The normal write-only idle path is the overwhelmingly common case. Avoid
   // even reading the microsecond clock unless there is pending work.
@@ -412,6 +437,9 @@ void NextionSimple::enter_writeonly_mode_() {
   this->rx_enabled_ = false;
   this->reset_rx_state_();
   this->mode_ = NxMode::RUN_WRITEONLY;
+  this->last_resync_ms_ = millis();
+  this->last_health_check_ms_ = millis();
+  this->health_check_fail_count_ = 0;
 
   const uint32_t now = millis();
   if (now - this->last_ready_ms_ >= this->nextion_ready_cooldown_) {
@@ -433,6 +461,7 @@ void NextionSimple::request_health_check_() {
 
   this->rx_enabled_ = true;
   this->saw_expected_reply_ = false;
+  this->health_check_active_ = true;
   this->reset_rx_state_();
   this->diag_deadline_ms_ = millis() + this->diag_timeout_ms_;
   this->mode_ = NxMode::DIAG_CHECK;
@@ -466,10 +495,8 @@ void NextionSimple::diagnostic_tick_(uint32_t loop_deadline_us) {
     }
 
     if (millis() >= this->diag_deadline_ms_) {
-      if (this->page_sync_attempts_left_ == 0 || this->page_sync_attempts_left_ > 1) {
-        if (this->page_sync_attempts_left_ > 1) {
-          this->page_sync_attempts_left_--;
-        }
+      if (this->page_sync_attempts_left_ > 1) {
+        this->page_sync_attempts_left_--;
         ESP_LOGW(TAG, "Nextion page %d not confirmed, retrying (%u attempt(s) left)",
                  this->page_sync_target_, static_cast<unsigned>(this->page_sync_attempts_left_));
         this->saw_expected_reply_ = false;
@@ -499,6 +526,10 @@ void NextionSimple::diagnostic_tick_(uint32_t loop_deadline_us) {
   }
 
   if (this->saw_expected_reply_ || millis() >= this->diag_deadline_ms_) {
+    const bool ok = this->saw_expected_reply_;
+    const bool was_health_check = this->health_check_active_;
+    this->health_check_active_ = false;
+
     if (this->bkcmd_ != 0) {
       this->send_command_printf("bkcmd=0");
       this->bkcmd_ = 0;
@@ -506,6 +537,15 @@ void NextionSimple::diagnostic_tick_(uint32_t loop_deadline_us) {
     this->rx_enabled_ = false;
     this->reset_rx_state_();
     this->mode_ = NxMode::RUN_WRITEONLY;
+
+    if (was_health_check && !ok) {
+      this->health_check_fail_count_++;
+      ESP_LOGW(TAG, "Nextion health check failed (%u in a row), re-syncing",
+               static_cast<unsigned>(this->health_check_fail_count_));
+      this->start_init_handshake_();
+    } else if (was_health_check) {
+      this->health_check_fail_count_ = 0;
+    }
   }
 }
 
@@ -698,7 +738,16 @@ void NextionSimple::txm_clear_dirty_(TxMirrorEntry &entry) {
   entry.dirty_next = nullptr;
 }
 
-
+void NextionSimple::resync_tick_() {
+  for (auto &e : this->txm_) {
+    if (e.used && !e.dirty)
+      this->txm_mark_dirty_(e, false);
+  }
+  for (auto &e : this->txm_overflow_) {
+    if (e.used && !e.dirty)
+      this->txm_mark_dirty_(e, false);
+  }
+}
 
 bool NextionSimple::txm_build_command_(TxMirrorEntry &e) {
   e.cmd_len = 0;
@@ -814,6 +863,23 @@ bool NextionSimple::txm_set_text_(const char *component_name, const char *text) 
   if (component_name == nullptr || *component_name == '\0')
     return false;
   const char *text_ptr = text == nullptr ? "" : text;
+
+  std::string truncated;
+  const size_t fixed_overhead = strlen(".txt=\"\"") + strlen(component_name);
+  const size_t available = fixed_overhead < kMaxCmd ? (kMaxCmd - fixed_overhead) : 0;
+  const size_t max_raw_len = available / 2;
+  size_t text_len = strlen(text_ptr);
+  if (text_len > max_raw_len) {
+    truncated.assign(text_ptr, max_raw_len);
+    text_ptr = truncated.c_str();
+    const uint32_t now = millis();
+    if (now - this->text_trunc_last_log_ms_ >= 5000) {
+      ESP_LOGW(TAG, "Text for component '%s' truncated from %u to %u bytes to fit the command buffer",
+               component_name, static_cast<unsigned>(text_len), static_cast<unsigned>(max_raw_len));
+      this->text_trunc_last_log_ms_ = now;
+    }
+  }
+
   const uint32_t key = make_coalesce_key_(fnv1a32_(component_name), TxCoalesceKind::TXT);
   auto *e = this->txm_find_or_alloc_(key, component_name, TxMirrorKind::TXT);
   if (e == nullptr)
@@ -882,6 +948,12 @@ void NextionSimple::tx_flush_(uint32_t loop_deadline_us) {
 
     if (send_dirty) {
       if (dirty->cmd_len == 0 && !this->txm_build_command_(*dirty)) {
+        const uint32_t fail_log_ms = millis();
+        if (fail_log_ms - this->tx_build_fail_last_log_ms_ >= 5000) {
+          ESP_LOGW(TAG, "Dropping oversized command for component '%s' (kind=%u); update did not fit in %u bytes",
+                   dirty->component.c_str(), static_cast<unsigned>(dirty->kind), static_cast<unsigned>(kMaxCmd));
+          this->tx_build_fail_last_log_ms_ = fail_log_ms;
+        }
         this->txm_clear_dirty_(*dirty);
         continue;
       }
@@ -908,10 +980,11 @@ void NextionSimple::tx_flush_(uint32_t loop_deadline_us) {
 
   if (bytes_sent_this_tick > 0) {
     const uint32_t baud = this->uart_parent_->get_baud_rate();
-    // (1 start + 8 data + 1 stop bit) = 10 bits per byte. 
-    // Time in microseconds = (bytes * 10 * 1000000) / baud
-    const uint32_t transmit_time_us = (bytes_sent_this_tick * 10ULL * 1000000ULL) / baud;
-    this->uart_clear_micros_ = micros() + transmit_time_us;
+    if (baud > 0) {
+      // (1 start + 8 data + 1 stop bit) = 10 bits per byte.
+      const uint32_t transmit_time_us = (bytes_sent_this_tick * 10ULL * 1000000ULL) / baud;
+      this->uart_clear_micros_ = micros() + transmit_time_us;
+    }
   }
 }
 
@@ -1219,8 +1292,16 @@ void NextionSimple::set_page(const std::string &page_name) {
 }
 
 void NextionSimple::set_page_verified(int page, uint8_t retries, uint32_t verify_timeout_ms) {
-  if (page < 0 || this->uart_parent_ == nullptr || this->upload_in_progress_)
+  if (page < 0 || this->uart_parent_ == nullptr)
     return;
+
+  if (this->upload_in_progress_) {
+    this->pending_page_sync_ = true;
+    this->pending_page_sync_page_ = page;
+    this->pending_page_sync_retries_ = retries;
+    this->pending_page_sync_timeout_ms_ = verify_timeout_ms;
+    return;
+  }
 
   this->page_sync_active_ = true;
   this->page_sync_target_ = page;
@@ -1288,6 +1369,15 @@ void NextionSimple::send_command_printf(const char *fmt, ...) {
 
 void NextionSimple::reset_nextion() {
   this->send_command_printf("rest");
+
+  if (this->upload_in_progress_)
+    return;
+  this->bkcmd_ = 0xFF;
+  this->current_page_ = -1;
+  this->page_sync_active_ = false;
+  this->page_sync_target_ = -1;
+  this->page_sync_attempts_left_ = 0;
+  this->start_init_handshake_();
 }
 
 void NextionSimple::upload_tft() {

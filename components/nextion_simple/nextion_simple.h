@@ -38,6 +38,8 @@ class NextionSimple : public Component {
   void set_tx_max_bytes_per_loop(uint16_t max_bytes) { this->tx_max_bytes_per_loop_ = max_bytes; }
   void set_tx_time_budget_us(uint32_t budget_us) { this->tx_time_budget_us_ = budget_us; }
   void set_loop_time_budget_us(uint32_t budget_us) { this->loop_time_budget_us_ = budget_us; }
+  void set_resync_interval_ms(uint32_t interval_ms) { this->resync_interval_ms_ = interval_ms; }
+  void set_health_check_interval_ms(uint32_t interval_ms) { this->health_check_interval_ms_ = interval_ms; }
 
   // High-level API
   void set_component_value(const char *component_name, float value);
@@ -195,6 +197,7 @@ class NextionSimple : public Component {
   bool txm_set_prop_int_(const char *component_name, const char *prop, TxCoalesceKind kind, int value);
   bool txm_set_vis_(const char *component_name, int state);
   bool txm_set_text_(const char *component_name, const char *text);
+  void resync_tick_();
 
   #if defined(USE_ESP32)
   uint8_t tx_max_per_loop_{6};
@@ -252,11 +255,13 @@ class NextionSimple : public Component {
   uart::UARTComponent *uart_parent_{nullptr};
   std::string tft_url_;
 
-  uint8_t bkcmd_{3};
+  uint8_t bkcmd_{0xFF};  // 0xFF = unknown, forces an explicit resync
   uint8_t tx_buf_[kMaxCmd + 3]{};
   size_t tx_len_{0};
 
   uint32_t tx_trunc_last_log_ms_{0};
+  uint32_t tx_build_fail_last_log_ms_{0};
+  uint32_t text_trunc_last_log_ms_{0};
 
   static constexpr size_t RB_SIZE = 1024;
   static_assert((RB_SIZE & (RB_SIZE - 1)) == 0, "RB_SIZE must be power of two");
@@ -330,6 +335,14 @@ class NextionSimple : public Component {
   uint32_t nextion_ready_cooldown_{500};
   uint32_t last_ready_ms_{0};
 
+  uint32_t resync_interval_ms_{30000};
+  uint32_t last_resync_ms_{0};
+
+  uint32_t health_check_interval_ms_{15000};
+  uint32_t last_health_check_ms_{0};
+  bool health_check_active_{false};
+  uint8_t health_check_fail_count_{0};
+
   bool upload_in_progress_{false};
   bool is_updating_{false};
   bool upload_first_chunk_sent_{false};
@@ -341,6 +354,12 @@ class NextionSimple : public Component {
   bool page_sync_active_{false};
   int page_sync_target_{-1};
   uint8_t page_sync_attempts_left_{0};
+
+  bool upload_active_prev_{false};
+  bool pending_page_sync_{false};
+  int pending_page_sync_page_{-1};
+  uint8_t pending_page_sync_retries_{0};
+  uint32_t pending_page_sync_timeout_ms_{0};
 
   NxMode mode_{NxMode::INIT};
 
