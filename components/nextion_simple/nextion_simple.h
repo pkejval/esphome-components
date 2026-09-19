@@ -7,11 +7,13 @@
 #include "esphome/core/automation.h"
 #include "esphome/core/color.h"
 
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>

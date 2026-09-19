@@ -1163,6 +1163,11 @@ void NextionSimple::send_set_text_formatted_(const std::string &component_name, 
 // ================= High-level API =================
 
 void NextionSimple::set_component_value(const char *component_name, float value) {
+  if (!std::isfinite(value))
+    return;
+  if (value <= static_cast<float>(std::numeric_limits<int>::min()) ||
+      value >= static_cast<float>(std::numeric_limits<int>::max()))
+    return;
   this->send_prop_int_(component_name, "val", TxCoalesceKind::VAL, static_cast<int>(value));
 }
 
